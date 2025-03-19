@@ -23,8 +23,6 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	// Import controller package
-	. "github.com/almightykid/k8lex/internal/controller/notifications"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/stretchr/testify/assert"
@@ -112,9 +110,10 @@ func TestSendNotification(t *testing.T) {
 	defer ts.Close() // Ensure the server is closed after the test
 
 	// Step 3: Call the sendNotification function directly with the mock server URL
-	webhookURL := ts.URL // This is the URL of the mock server
+	//webhookURL := ts.URL // This is the URL of the mock server
+	webhookURL := "https://hooks.slack.com/services/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"
 	message := "Test message"
-	err := notifications.SendNotification(webhookURL, message)
+	err := sendNotification(webhookURL, message)
 
 	// Step 4: Assert no error was returned
 	assert.NoError(t, err)
