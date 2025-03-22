@@ -1,0 +1,32 @@
+apiVersion: policies.example.com/v1alpha1
+kind: ClusterPolicyValidator
+metadata:
+  name: no-latest-image-validator
+spec:
+  description: "Valida que las imágenes de los contenedores no utilicen la etiqueta 'latest'."
+  validationRules:
+    - name: "no-latest-tag"
+      description: "Verifica que las imágenes no usen el tag 'latest'."
+      severity: "High"
+      errorMessage: "El contenedor en el recurso {{ .metadata.name }} del namespace {{ .metadata.namespace }} no puede usar la etiqueta 'latest' para la imagen."
+      matchResources:
+        kinds:
+          - Pod
+      conditions:
+        - key: spec.containers[*].image
+          operator: "NotIn"
+          values:
+            - "latest"
+      action: "Block"  # block | warn | continue
+  notification:
+    enabled: true  # Configuración global de notificación
+    notifierRef:
+      name: mi-notifier
+      namespace: default
+
+
+## Operador 
+  ## Lists: "In", "NotIn" -> Si el valor está o no en la lista de valores
+  ## Existence: "Exists", "DoesNotExist" -> Existe o no la key en el recurso
+  ## Numbers: "GreaterThan", "LessThan", "Equal", "NotEqual", "GreaterThanOrEqual", "LessThanOrEqual" -> Comparaciones numéricas, solo acepta un valor
+  ## Strings:  "DoesNotMatch", "Matches" -> Comparaciones de cadenas, solo acepta un valor

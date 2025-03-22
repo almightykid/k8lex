@@ -1,0 +1,9 @@
+apiVersion: clusterpolicyupdater.k8lex.io/v1alpha1
+kind: ClusterPolicyUpdater
+metadata:
+  labels:
+    app.kubernetes.io/name: k8lex
+    app.kubernetes.io/managed-by: kustomize
+  name: clusterpolicyupdater-sample
+spec:
+  # TODO(user): Add fields here

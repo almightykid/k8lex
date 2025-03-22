@@ -1,0 +1,27 @@
+# permissions for end users to edit clusterpolicyupdaters.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: k8lex
+    app.kubernetes.io/managed-by: kustomize
+  name: clusterpolicyupdater-clusterpolicyupdater-editor-role
+rules:
+- apiGroups:
+  - clusterpolicyupdater.k8lex.io
+  resources:
+  - clusterpolicyupdaters
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - clusterpolicyupdater.k8lex.io
+  resources:
+  - clusterpolicyupdaters/status
+  verbs:
+  - get

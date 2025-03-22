@@ -1,0 +1,23 @@
+# permissions for end users to view clusterpolicyvalidators.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: k8lex
+    app.kubernetes.io/managed-by: kustomize
+  name: clusterpolicyvalidator-clusterpolicyvalidator-viewer-role
+rules:
+- apiGroups:
+  - clusterpolicyvalidator.k8lex.io
+  resources:
+  - clusterpolicyvalidators
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - clusterpolicyvalidator.k8lex.io
+  resources:
+  - clusterpolicyvalidators/status
+  verbs:
+  - get

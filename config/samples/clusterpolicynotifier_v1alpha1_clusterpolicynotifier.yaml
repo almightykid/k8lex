@@ -1,0 +1,9 @@
+apiVersion: clusterpolicynotifier.k8lex.io/v1alpha1
+kind: ClusterPolicyNotifier
+metadata:
+  labels:
+    app.kubernetes.io/name: k8lex
+    app.kubernetes.io/managed-by: kustomize
+  name: clusterpolicynotifier-sample
+spec:
+  # TODO(user): Add fields here

@@ -1,0 +1,9 @@
+apiVersion: clusterpolicyvalidator.k8lex.io/v1alpha1
+kind: ClusterPolicyValidator
+metadata:
+  labels:
+    app.kubernetes.io/name: k8lex
+    app.kubernetes.io/managed-by: kustomize
+  name: clusterpolicyvalidator-sample
+spec:
+  # TODO(user): Add fields here

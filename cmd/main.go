@@ -35,10 +35,14 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
-	notificationsv1alpha1 "github.com/almightykid/k8lex/api/notifications/v1alpha1"
-	policiesv1alpha1 "github.com/almightykid/k8lex/api/v1alpha1"
-	"github.com/almightykid/k8lex/internal/controller"
-	notificationscontroller "github.com/almightykid/k8lex/internal/controller/notifications"
+	clusterpolicynotifierv1alpha1 "github.com/almightykid/k8lex/api/clusterpolicynotifier/v1alpha1"
+	clusterpolicysetv1alpha1 "github.com/almightykid/k8lex/api/clusterpolicyset/v1alpha1"
+	clusterpolicyupdaterv1alpha1 "github.com/almightykid/k8lex/api/clusterpolicyupdater/v1alpha1"
+	clusterpolicyvalidatorv1alpha1 "github.com/almightykid/k8lex/api/clusterpolicyvalidator/v1alpha1"
+	clusterpolicynotifiercontroller "github.com/almightykid/k8lex/internal/controller/clusterpolicynotifier"
+	clusterpolicysetcontroller "github.com/almightykid/k8lex/internal/controller/clusterpolicyset"
+	clusterpolicyupdatercontroller "github.com/almightykid/k8lex/internal/controller/clusterpolicyupdater"
+	clusterpolicyvalidatorcontroller "github.com/almightykid/k8lex/internal/controller/clusterpolicyvalidator"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -50,8 +54,10 @@ var (
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 
-	utilruntime.Must(policiesv1alpha1.AddToScheme(scheme))
-	utilruntime.Must(notificationsv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(clusterpolicyvalidatorv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(clusterpolicyupdaterv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(clusterpolicysetv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(clusterpolicynotifierv1alpha1.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
 }
 
@@ -147,18 +153,32 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err = (&controller.ClusterPolicyValidatorReconciler{
+	if err = (&clusterpolicyvalidatorcontroller.ClusterPolicyValidatorReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "ClusterPolicyValidator")
 		os.Exit(1)
 	}
-	if err = (&notificationscontroller.NotifierReconciler{
+	if err = (&clusterpolicyupdatercontroller.ClusterPolicyUpdaterReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "Notifier")
+		setupLog.Error(err, "unable to create controller", "controller", "ClusterPolicyUpdater")
+		os.Exit(1)
+	}
+	if err = (&clusterpolicysetcontroller.ClusterPolicySetReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "ClusterPolicySet")
+		os.Exit(1)
+	}
+	if err = (&clusterpolicynotifiercontroller.ClusterPolicyNotifierReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "ClusterPolicyNotifier")
 		os.Exit(1)
 	}
 	// +kubebuilder:scaffold:builder

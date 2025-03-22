@@ -22,8 +22,12 @@ resources:
 # default, aiding admins in cluster management. Those roles are
 # not used by the Project itself. You can comment the following lines
 # if you do not want those helpers be installed with your Project.
-- notifications_notifier_editor_role.yaml
-- notifications_notifier_viewer_role.yaml
-- clusterpolicyvalidator_editor_role.yaml
-- clusterpolicyvalidator_viewer_role.yaml
+- clusterpolicynotifier_clusterpolicynotifier_editor_role.yaml
+- clusterpolicynotifier_clusterpolicynotifier_viewer_role.yaml
+- clusterpolicyset_clusterpolicyset_editor_role.yaml
+- clusterpolicyset_clusterpolicyset_viewer_role.yaml
+- clusterpolicyupdater_clusterpolicyupdater_editor_role.yaml
+- clusterpolicyupdater_clusterpolicyupdater_viewer_role.yaml
+- clusterpolicyvalidator_clusterpolicyvalidator_editor_role.yaml
+- clusterpolicyvalidator_clusterpolicyvalidator_viewer_role.yaml
 

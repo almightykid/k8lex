@@ -1,5 +1,7 @@
 ## Append samples of your project ##
 resources:
-- policies_v1alpha1_clusterpolicyvalidator.yaml
-- notifications_v1alpha1_notifier.yaml
+- clusterpolicyvalidator_v1alpha1_clusterpolicyvalidator.yaml
+- clusterpolicyupdater_v1alpha1_clusterpolicyupdater.yaml
+- clusterpolicyset_v1alpha1_clusterpolicyset.yaml
+- clusterpolicynotifier_v1alpha1_clusterpolicynotifier.yaml
 # +kubebuilder:scaffold:manifestskustomizesamples

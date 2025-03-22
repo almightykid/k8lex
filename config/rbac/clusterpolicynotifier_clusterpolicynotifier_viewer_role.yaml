@@ -1,0 +1,23 @@
+# permissions for end users to view clusterpolicynotifiers.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: k8lex
+    app.kubernetes.io/managed-by: kustomize
+  name: clusterpolicynotifier-clusterpolicynotifier-viewer-role
+rules:
+- apiGroups:
+  - clusterpolicynotifier.k8lex.io
+  resources:
+  - clusterpolicynotifiers
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - clusterpolicynotifier.k8lex.io
+  resources:
+  - clusterpolicynotifiers/status
+  verbs:
+  - get

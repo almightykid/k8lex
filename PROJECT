@@ -17,17 +17,35 @@ resources:
     namespaced: true
   controller: true
   domain: k8lex.io
-  group: policies
+  group: clusterpolicyvalidator
   kind: ClusterPolicyValidator
-  path: github.com/almightykid/k8lex/api/v1alpha1
+  path: github.com/almightykid/k8lex/api/clusterpolicyvalidator/v1alpha1
   version: v1alpha1
 - api:
     crdVersion: v1
     namespaced: true
   controller: true
   domain: k8lex.io
-  group: notifications
-  kind: Notifier
-  path: github.com/almightykid/k8lex/api/notifications/v1alpha1
+  group: clusterpolicyupdater
+  kind: ClusterPolicyUpdater
+  path: github.com/almightykid/k8lex/api/clusterpolicyupdater/v1alpha1
+  version: v1alpha1
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: k8lex.io
+  group: clusterpolicyset
+  kind: ClusterPolicySet
+  path: github.com/almightykid/k8lex/api/clusterpolicyset/v1alpha1
+  version: v1alpha1
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: k8lex.io
+  group: clusterpolicynotifier
+  kind: ClusterPolicyNotifier
+  path: github.com/almightykid/k8lex/api/clusterpolicynotifier/v1alpha1
   version: v1alpha1
 version: "3"
