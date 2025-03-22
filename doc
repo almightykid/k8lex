@@ -1,0 +1,152 @@
+Pendiente para manana
+
+- Mover los operadores a un subdirectorio
+- Considerar que hacer con la validacion previa a la key y la necesidad de tener el operador exists/noExists.
+- Testearlo.
+- Arreglar las notificaciones.
+
+------
+
+1. ClusterPolicyValidator
+    - Define las reglas de validación que se aplicarán a los recursos del clúster.
+    - Similar a Kyverno, pero con mejoras en eficiencia y caché.
+    - En caso de violar la politica se anade una anotacion:     policy/<policy-violated>: "true"
+2. ClusterPolicyUpdater
+    - Define acciones que el operador tomará si una regla no se cumple.
+    - No solo valida, sino que modifica recursos en base al contexto (ej. límites más restrictivos en producción).
+3. ClusterPolicySet
+    - Permite agrupar varias políticas (Validator y Updater) en un solo conjunto.
+    - Facilita la gestión de múltiples reglas bajo una misma entidad.
+    - Mas detalle abajo
+4. ClusterPolicyNotifier
+    - Define la integración con sistemas de notificación: Slack, Teams e email.
+    - Envío de alertas cuando se detectan o corrigen problemas en el clúster.
+
+-----------------------------
+
+
+1. Revisión de los Requerimientos y Casos de Uso
+Primero, asegúrate de tener claro cómo se va a utilizar el operador en diferentes situaciones. Esto te ayudará a entender cómo estructurar los demás componentes y qué funcionalidades adicionales agregar.
+
+Validación: ¿Qué recursos o configuraciones necesitas validar? ¿Cuáles son los criterios exactos?
+
+Actualización: ¿Cuáles son las acciones que el operador debe ejecutar cuando se incumple una política? ¿Cómo manejarás estas actualizaciones?
+
+Integración con Notifier: Ya que el notificador está funcionando, considera cómo lo integrarás con el resto de las funciones para enviar alertas (por ejemplo, cuando una política es violada o cuando se actualiza un recurso).
+
+2. Desarrollar el Bloque de Validación (ClusterPolicyValidator)
+A continuación, puedes centrarte en el bloque de validación. Esto implicaría:
+
+Definir las reglas de validación para los diferentes recursos que vas a controlar (Pods, Deployments, etc.).
+
+Implementar la lógica de validación: El operador debe inspeccionar los recursos para asegurarse de que cumplen con las políticas definidas. Puedes hacerlo utilizando el controlador del operador para escuchar cambios en los recursos y aplicar las reglas.
+
+Manejo de errores: Cuando se detecte una infracción, el operador debería registrar este problema, generar un informe y posiblemente interactuar con el notificador para enviar alertas.
+
+3. Desarrollar el Bloque de Actualización (ClusterPolicyUpdater)
+Una vez que tengas el validador funcionando, puedes empezar a implementar el bloque de actualización, que actuará cuando se detecten violaciones de política.
+
+Definir las acciones a tomar cuando no se cumplan las políticas: Por ejemplo, actualizar una imagen de contenedor, ajustar límites de recursos o reconfigurar algún parámetro en el recurso.
+
+Asegurar que las actualizaciones sean idempotentes: Es importante que el operador pueda aplicarlas varias veces sin causar efectos secundarios no deseados.
+
+4. Agrupar las Políticas con ClusterPolicySet
+Cuando tengas los bloques de validación y actualización, agrúpalos en conjuntos de políticas usando ClusterPolicySet.
+
+Configurar relaciones entre validadores y actualizadores: Por ejemplo, un ClusterPolicySet podría contener tanto validadores como actualizadores relacionados con el control de imágenes de contenedores, recursos, etc.
+
+Asegurarte de que el operador pueda aplicar o desactivar todo el conjunto: Esto facilitará la gestión de las políticas, permitiendo aplicar todas las reglas de un conjunto con una sola operación.
+
+5. Informe y Auditoría con PolicyReport
+Una vez que tengas las políticas en su lugar, el siguiente paso será generar informes sobre el cumplimiento de las políticas.
+
+Definir qué información se debe incluir en los informes: Podría ser la lista de recursos que no cumplen con las políticas, qué acciones se han tomado y si ha habido notificaciones enviadas.
+
+Decidir el formato de los informes: Como mencionaste antes, puedes generar informes en JSON o CSV para facilitar su consumo y análisis.
+
+6. Pruebas
+A medida que desarrollas los diferentes bloques, realiza pruebas continuas en un entorno de prueba para asegurarte de que las políticas se validen y actualicen correctamente, y que las alertas se envíen como se espera.
+
+Pruebas unitarias y de integración: Asegúrate de que cada componente funcione de manera aislada y también de que todo el sistema trabaje bien en conjunto.
+
+Pruebas de comportamiento en clúster: Asegúrate de que las políticas respondan correctamente a cambios en los recursos y que el operador reaccione adecuadamente.
+
+7. Documentación
+No olvides documentar bien tu operador, incluyendo cómo configurarlo, cómo se deben escribir las políticas y cómo se puede extender o modificar el comportamiento. Esto es clave si otras personas van a usar tu operador o si lo vas a mantener a largo plazo.
+
+
+
+
+
+
+
+
+
+--------------------------
+Cluster Policy Set
+
+¡Te entiendo perfectamente! Estás trabajando en un operador personalizado utilizando Operator SDK similar a Kyverno, y ya has definido varios recursos clave como ClusterPolicyValidator, ClusterPolicyUpdater, Notifier, y PolicyReport. Sin embargo, te sientes un poco dudoso acerca del recurso ClusterPolicySet y su utilidad dentro de esta arquitectura.
+
+Voy a intentar aclarar la utilidad de ClusterPolicySet en este contexto.
+
+¿Qué es ClusterPolicySet?
+Un ClusterPolicySet en tu operador podría actuar como una entidad que agrupa múltiples políticas relacionadas (tanto ClusterPolicyValidator como ClusterPolicyUpdater) bajo una única definición o conjunto. En lugar de gestionar las políticas de forma individual, este recurso permite organizar y manejar varias políticas relacionadas de forma más eficiente.
+
+¿Por qué podría ser útil un ClusterPolicySet?
+Aquí te dejo algunos puntos que podrían justificar la existencia y utilidad de este recurso dentro de tu operador:
+
+1. Gestión Centralizada de Políticas
+Cuando tienes varias reglas que se deben aplicar en el clúster, agruparlas en un set tiene sentido porque facilita su gestión:
+
+Simplificación: En lugar de tener que gestionar y aplicar políticas individualmente (por ejemplo, varias validaciones y actualizaciones de políticas), puedes tener una vista unificada de todas las políticas que están relacionadas entre sí.
+
+Facilita el ciclo de vida: Si necesitas activar, desactivar o modificar un conjunto completo de políticas, un ClusterPolicySet te permite hacerlo de manera sencilla sin tener que lidiar con cada política de forma separada.
+
+2. Desacoplamiento de Políticas
+Supón que tienes una serie de validadores que están directamente relacionados con ciertos actualizadores. Por ejemplo, una política que valida que los Pods no tengan una imagen no confiable, y otra política que actualiza esa imagen a una versión confiable si se detecta que no es válida.
+
+En este caso, puedes definir ambas en un solo ClusterPolicySet para que se apliquen de forma conjunta, lo que mejora la coherencia y consistencia en cómo se manejan las reglas y acciones en el clúster.
+
+3. Escalabilidad y Flexibilidad
+A medida que tu sistema crece, puede que necesites manejar diferentes tipos de políticas o incluso aplicar diferentes conjuntos de políticas en distintos contextos (como entornos de desarrollo, pruebas y producción). Tener un ClusterPolicySet te permite:
+
+Escalar fácilmente: Puedes definir varios sets de políticas para diferentes entornos o grupos de recursos, asegurando que el operador pueda manejar distintos conjuntos de políticas sin que se mezcle todo.
+
+Flexibilidad: Este recurso permite que se apliquen varias políticas conjuntamente o por separado según las necesidades del clúster, lo que da mayor flexibilidad al operador.
+
+4. Auditoría y Control
+Si integras tu operador con un sistema de auditoría o reportes de cumplimiento, tener un ClusterPolicySet puede ser útil para:
+
+Seguir el estado de las políticas: Puedes ver el estado de todo un conjunto de políticas en lugar de tener que consultar cada política individualmente. Esto ayuda a tener una visión más global de cómo están funcionando las reglas en el clúster.
+
+Generar reportes más fáciles de leer: Si cada conjunto de políticas genera su propio reporte, puedes proporcionar informes consolidados que muestren el cumplimiento de todo el set de políticas, lo que facilita la auditoría.
+
+5. Mejorar la Gestión de Políticas en Equipos
+Cuando varios equipos trabajan con políticas de seguridad, gestión de recursos, etc., puede ser útil agrupar políticas bajo un ClusterPolicySet para que diferentes equipos gestionen conjuntos de políticas en lugar de tener que ocuparse de cada política individualmente.
+
+Manejo grupal: Los equipos pueden colaborar en la creación de un ClusterPolicySet, asegurando que las políticas y las acciones (como validaciones y actualizaciones) estén alineadas y trabajen en conjunto.
+
+Ejemplo:
+Supongamos que tienes las siguientes políticas:
+
+Policy 1: Valida que las imágenes de los contenedores sean de una fuente confiable.
+
+Policy 2: Valida que los Pods tengan recursos correctamente configurados (memoria, CPU).
+
+Policy 3: Actualiza las imágenes de los contenedores no confiables a una versión específica.
+
+Policy 4: Limita los recursos de los Pods a un máximo más restrictivo en producción.
+
+Podrías agrupar estas políticas dentro de un ClusterPolicySet que gestione las validaciones (Policy 1, 2) y las actualizaciones (Policy 3, 4) en un solo conjunto.
+
+apiVersion: custom.example.com/v1
+kind: ClusterPolicySet
+metadata:
+  name: seguridad-produccion
+spec:
+  policies:
+    - policyRef: "policy-validator-imagenes-contenedor"
+    - policyRef: "policy-validator-recursos"
+    - policyRef: "policy-updater-imagenes"
+    - policyRef: "policy-updater-limite-recursos"
+En este ejemplo, el ClusterPolicySet agrupa las políticas de validación y actualización, lo que te permite gestionar el conjunto completo de manera eficiente. Puedes aplicar o desactivar este conjunto de políticas a todos los Pods o recursos de producción, asegurando que todas las reglas relacionadas se gestionen de forma coherente.
