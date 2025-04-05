@@ -1,11 +1,110 @@
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  labels:
-    app.kubernetes.io/name: k8lex
-    app.kubernetes.io/managed-by: kustomize
   name: manager-role
 rules:
-- apiGroups: [""]
-  resources: ["pods"]
-  verbs: ["get", "list", "watch"]
+- apiGroups:
+  - clusterpolicynotifier.k8lex.io
+  resources:
+  - clusterpolicynotifiers
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - clusterpolicynotifier.k8lex.io
+  resources:
+  - clusterpolicynotifiers/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - clusterpolicynotifier.k8lex.io
+  resources:
+  - clusterpolicynotifiers/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - clusterpolicyset.k8lex.io
+  resources:
+  - clusterpolicysets
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - clusterpolicyset.k8lex.io
+  resources:
+  - clusterpolicysets/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - clusterpolicyset.k8lex.io
+  resources:
+  - clusterpolicysets/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - clusterpolicyupdater.k8lex.io
+  resources:
+  - clusterpolicyupdaters
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - clusterpolicyupdater.k8lex.io
+  resources:
+  - clusterpolicyupdaters/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - clusterpolicyupdater.k8lex.io
+  resources:
+  - clusterpolicyupdaters/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - clusterpolicyvalidator.k8lex.io
+  resources:
+  - clusterpolicyvalidators
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - clusterpolicyvalidator.k8lex.io
+  resources:
+  - clusterpolicyvalidators/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - clusterpolicyvalidator.k8lex.io
+  resources:
+  - clusterpolicyvalidators/status
+  verbs:
+  - get
+  - patch
+  - update

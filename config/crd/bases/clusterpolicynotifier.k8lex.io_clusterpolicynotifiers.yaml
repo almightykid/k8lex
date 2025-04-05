@@ -1,0 +1,100 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.16.1
+  name: clusterpolicynotifiers.clusterpolicynotifier.k8lex.io
+spec:
+  group: clusterpolicynotifier.k8lex.io
+  names:
+    kind: ClusterPolicyNotifier
+    listKind: ClusterPolicyNotifierList
+    plural: clusterpolicynotifiers
+    singular: clusterpolicynotifier
+  scope: Namespaced
+  versions:
+  - name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: ClusterPolicyNotifier is the Schema for the clusterpolicynotifiers
+          API
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: ClusterPolicyNotifierSpec defines the desired state of ClusterPolicyNotifier
+            properties:
+              email:
+                properties:
+                  authPassword:
+                    type: string
+                  authUser:
+                    type: string
+                  fromEmail:
+                    type: string
+                  smtpPort:
+                    type: integer
+                  smtpServer:
+                    type: string
+                  toEmail:
+                    items:
+                      type: string
+                    type: array
+                required:
+                - authPassword
+                - authUser
+                - fromEmail
+                - smtpPort
+                - smtpServer
+                - toEmail
+                type: object
+              slack:
+                properties:
+                  channel:
+                    type: string
+                  webhookUrl:
+                    type: string
+                required:
+                - channel
+                - webhookUrl
+                type: object
+              teams:
+                properties:
+                  webhookUrl:
+                    type: string
+                required:
+                - webhookUrl
+                type: object
+            type: object
+          status:
+            description: ClusterPolicyNotifierStatus defines the observed state of
+              ClusterPolicyNotifier
+            properties:
+              lastSentNotification:
+                description: |-
+                  INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
+                  Important: Run "make" to regenerate code after modifying this file
+                format: date-time
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

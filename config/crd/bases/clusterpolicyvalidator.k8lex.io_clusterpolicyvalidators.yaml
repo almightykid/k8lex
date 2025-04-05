@@ -1,0 +1,150 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.16.1
+  name: clusterpolicyvalidators.clusterpolicyvalidator.k8lex.io
+spec:
+  group: clusterpolicyvalidator.k8lex.io
+  names:
+    kind: ClusterPolicyValidator
+    listKind: ClusterPolicyValidatorList
+    plural: clusterpolicyvalidators
+    singular: clusterpolicyvalidator
+  scope: Namespaced
+  versions:
+  - name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: ClusterPolicyValidator is the Schema for the clusterpolicyvalidators
+          API
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: ClusterPolicyValidatorSpec defines the desired state of ClusterPolicyValidator
+            properties:
+              description:
+                type: string
+              notification:
+                properties:
+                  enabled:
+                    type: boolean
+                  notifierRef:
+                    properties:
+                      name:
+                        type: string
+                      namespace:
+                        type: string
+                    type: object
+                type: object
+              validationRules:
+                items:
+                  properties:
+                    action:
+                      type: string
+                    conditions:
+                      items:
+                        properties:
+                          key:
+                            type: string
+                          operator:
+                            type: string
+                          values:
+                            items:
+                              type: string
+                            type: array
+                        required:
+                        - key
+                        - operator
+                        - values
+                        type: object
+                      type: array
+                    description:
+                      type: string
+                    errorMessage:
+                      type: string
+                    labelSelector:
+                      properties:
+                        matchLabels:
+                          items:
+                            type: string
+                          type: array
+                      type: object
+                    matchResources:
+                      properties:
+                        kinds:
+                          items:
+                            type: string
+                          type: array
+                      required:
+                      - kinds
+                      type: object
+                    name:
+                      type: string
+                    namespaceSelector:
+                      properties:
+                        matchNamespaces:
+                          items:
+                            type: string
+                          type: array
+                      type: object
+                    severity:
+                      type: string
+                  required:
+                  - conditions
+                  - matchResources
+                  - name
+                  type: object
+                type: array
+            type: object
+          status:
+            description: ClusterPolicyValidatorStatus defines the observed state of
+              ClusterPolicyValidator
+            properties:
+              lastValidationTime:
+                description: Timestamp of the last validation run
+                format: date-time
+                type: string
+              notifierStatus:
+                description: Status of the notification system (e.g., whether notifications
+                  have been sent successfully)
+                type: string
+              overallStatus:
+                description: Overall status of the resource (Pending, Valid, Invalid)
+                type: string
+              validatedResourcesCount:
+                description: Optional field to store the number of successfully validated
+                  resources (if applicable)
+                type: integer
+              validationErrors:
+                description: List of errors encountered during validation, if any
+                items:
+                  type: string
+                type: array
+              validationStatus:
+                description: 'Status of the validation process: can be "Valid", "Invalid",
+                  "Pending", etc.'
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

@@ -38,13 +38,22 @@ type Ref struct {
 }
 
 type ValidationRule struct {
-	Name           string         `json:"name"`                   // Name of the validation rule
-	Description    string         `json:"description,omitempty"`  // Optional description of the rule
-	Severity       string         `json:"severity,omitempty"`     // Severity of the validation
-	ErrorMessage   string         `json:"errorMessage,omitempty"` // Error message if validation fails
-	MatchResources MatchResources `json:"matchResources"`         // Resources to which this rule applies
-	Conditions     []Condition    `json:"conditions"`             // Conditions for rule matching
-	Action         string         `json:"action,omitempty"`       // Action to take when the rule matches
+	Name              string            `json:"name"`                        // Name of the validation rule
+	Description       string            `json:"description,omitempty"`       // Optional description of the rule
+	Severity          string            `json:"severity,omitempty"`          // Severity of the validation
+	ErrorMessage      string            `json:"errorMessage,omitempty"`      // Error message if validation fails
+	MatchResources    MatchResources    `json:"matchResources"`              // Resources to which this rule applies
+	Conditions        []Condition       `json:"conditions"`                  // Conditions for rule matching
+	Action            string            `json:"action,omitempty"`            // Action to take when the rule matches
+	NamespaceSelector NamespaceSelector `json:"namespaceSelector,omitempty"` // Namespace selector for the rule
+	LabelSelector     LabelSelector     `json:"labelSelector,omitempty"`     // Label selector for the rule
+}
+
+type NamespaceSelector struct {
+	MatchNamespaces []string `json:"matchNamespaces,omitempty"` // List of namespaces to match
+}
+type LabelSelector struct {
+	MatchLabels []string `json:"matchLabels,omitempty"` // List of labels to match
 }
 
 type MatchResources struct {
