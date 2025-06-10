@@ -38,10 +38,10 @@ type Ref struct {
 }
 
 type ValidationRule struct {
-	Name              string            `json:"name"`                        // Name of the validation rule
-	Description       string            `json:"description,omitempty"`       // Optional description of the rule
-	Severity          string            `json:"severity,omitempty"`          // Severity of the validation
-	ErrorMessage      string            `json:"errorMessage,omitempty"`      // Error message if validation fails
+	Name              string            `json:"name"`                  // Name of the validation rule
+	Description       string            `json:"description,omitempty"` // Optional description of the rule
+	Severity          string            `json:"severity,omitempty"`    // Severity of the validation
+	ErrorMessage      string            `json:"errorMessage"`
 	MatchResources    MatchResources    `json:"matchResources"`              // Resources to which this rule applies
 	Conditions        []Condition       `json:"conditions"`                  // Conditions for rule matching
 	Action            string            `json:"action,omitempty"`            // Action to take when the rule matches

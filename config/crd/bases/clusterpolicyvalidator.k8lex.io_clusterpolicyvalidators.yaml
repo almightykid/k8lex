@@ -109,6 +109,7 @@ spec:
                       type: string
                   required:
                   - conditions
+                  - errorMessage
                   - matchResources
                   - name
                   type: object

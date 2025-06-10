@@ -2,22 +2,23 @@ apiVersion: clusterpolicyvalidator.k8lex.io/v1alpha1
 kind: ClusterPolicyValidator
 metadata:
   name: no-latest-image-validator
-  namespace: default
+  namespace: k8lex
 spec:
-  description: "Valida que las imágenes de los contenedores no utilicen la etiqueta 'latest'."
+  description: "Valida que las imágenes no utilicen la etiqueta 'latest'."
   validationRules:
     - name: "no-latest-tag"
       description: "Verifica que las imágenes no usen el tag 'latest'."
       severity: "High"
-      errorMessage: "El contenedor en el recurso {{ .metadata.name }} del namespace {{ .metadata.namespace }} no puede usar la etiqueta 'latest' para la imagen."
+      errorMessage: "El recurso no puede usar la etiqueta 'latest' para la imagen."
       matchResources:
         kinds:
           - Pod
+          - Deployment 
       conditions:
         - key: spec.containers[*].image
           operator: "NotIn"
           values:
             - "latest"
-      action: "Block"  # block | warn | continue
+      action: "Block"
   notification:
-    enabled: false  
+    enabled: false
