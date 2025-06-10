@@ -4,12 +4,14 @@ metadata:
   name: no-latest-image-validator
   namespace: k8lex
 spec:
-  description: "Valida que las imágenes no utilicen la etiqueta 'latest'."
+  description: "Validates that images do not use the 'latest' tag."
+  excludedNamespaces:
+    - kube-system
   validationRules:
     - name: "no-latest-tag"
-      description: "Verifica que las imágenes no usen el tag 'latest'."
+      description: "Checks that images do not use the 'latest' tag."
       severity: "High"
-      errorMessage: "El recurso no puede usar la etiqueta 'latest' para la imagen."
+      errorMessage: "The resource must not use the 'latest' tag for the image."
       matchResources:
         kinds:
           - Pod

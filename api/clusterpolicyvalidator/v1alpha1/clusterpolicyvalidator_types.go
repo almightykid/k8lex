@@ -23,8 +23,14 @@ import (
 // ClusterPolicyValidatorSpec defines the desired state of ClusterPolicyValidator
 type ClusterPolicyValidatorSpec struct {
 	Description     string           `json:"description,omitempty"`     // Description of the cluster policy validator
+	Namespaces      Namespace        `json:"namespaces,omitempty"`      // List of namespaces to exclude from validation
 	ValidationRules []ValidationRule `json:"validationRules,omitempty"` // List of validation rules
 	Notification    Notification     `json:"notification,omitempty"`    // Notification configuration
+}
+
+type Namespace struct {
+	Exclude []string `json:"exclude,omitempty"` // List of namespaces to exclude from validation
+	Include []string `json:"include,omitempty"` // List of namespaces to include in validation
 }
 
 type Notification struct {

@@ -42,6 +42,17 @@ spec:
             properties:
               description:
                 type: string
+              namespaces:
+                properties:
+                  exclude:
+                    items:
+                      type: string
+                    type: array
+                  include:
+                    items:
+                      type: string
+                    type: array
+                type: object
               notification:
                 properties:
                   enabled:

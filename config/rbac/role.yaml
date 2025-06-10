@@ -5,6 +5,47 @@ metadata:
   name: manager-role
 rules:
 - apiGroups:
+  - ""
+  resources:
+  - configmaps
+  - persistentvolumeclaims
+  - persistentvolumes
+  - pods
+  - services
+  verbs:
+  - delete
+  - get
+  - list
+  - watch
+- apiGroups:
+  - apps
+  resources:
+  - daemonsets
+  - statefulsets
+  verbs:
+  - delete
+  - get
+  - list
+  - watch
+- apiGroups:
+  - apps
+  resources:
+  - deployments
+  verbs:
+  - delete
+  - get
+  - list
+  - update
+  - watch
+- apiGroups:
+  - apps
+  resources:
+  - replicasets
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
   - clusterpolicynotifier.k8lex.io
   resources:
   - clusterpolicynotifiers
@@ -78,6 +119,32 @@ rules:
   - clusterpolicyupdater.k8lex.io
   resources:
   - clusterpolicyupdaters/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - clusterpolicyvalidator.k8lex.io
+  resources:
+  - clusterpolicyvalidators
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - clusterpolicyvalidator.k8lex.io
+  resources:
+  - clusterpolicyvalidators/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - clusterpolicyvalidator.k8lex.io
+  resources:
+  - clusterpolicyvalidators/status
   verbs:
   - get
   - patch

@@ -19,6 +19,8 @@ package clusterpolicyvalidator
 import (
 	"context"
 	"fmt"
+	"regexp"
+	"strconv"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -158,6 +160,24 @@ func (r *ClusterPolicyValidatorReconciler) Reconcile(ctx context.Context, req ct
 	return r.validateResource(ctx, req, logger)
 }
 
+func namespaceAllowed(resourceNamespace string, nsConfig clusterpolicyvalidatorv1alpha1.Namespace) bool {
+	if len(nsConfig.Include) > 0 {
+		for _, allowed := range nsConfig.Include {
+			if resourceNamespace == allowed {
+				return true
+			}
+		}
+		return false
+	}
+	for _, excluded := range nsConfig.Exclude {
+		if resourceNamespace == excluded {
+			return false
+		}
+	}
+
+	return true
+}
+
 // validateResource validates any Kubernetes resource against all ClusterPolicyValidator policies
 func (r *ClusterPolicyValidatorReconciler) validateResource(ctx context.Context, req ctrl.Request, logger logr.Logger) (ctrl.Result, error) {
 	// Try to get the resource as unstructured to handle any resource type
@@ -216,6 +236,13 @@ func (r *ClusterPolicyValidatorReconciler) validateResource(ctx context.Context,
 	for _, policy := range policies.Items {
 		// Check if this policy applies to this resource type
 		if !r.policyAppliesToResource(policy, resourceGVK) {
+			continue
+		}
+
+		if !namespaceAllowed(resource.GetNamespace(), policy.Spec.Namespaces) {
+			logger.V(1).Info("Skipping resource due to namespace filtering",
+				"namespace", resource.GetNamespace(),
+				"policy", policy.Name)
 			continue
 		}
 
@@ -566,33 +593,19 @@ func handleConditionValidation(operator string, conditionValues interface{}, res
 	switch operator {
 	case "NotIn":
 		var foundMatch []string
-
-		// Verify if conditionValues is a slice of strings or a slice of interfaces
-		var conditionValueList []interface{}
-		switch v := conditionValues.(type) {
-		case []string:
-			// Convert []string to []interface{}
-			for _, item := range v {
-				conditionValueList = append(conditionValueList, item)
-			}
-		case []interface{}:
-			conditionValueList = v
-		default:
-			logger.Error(nil, "Unsupported type for conditionValues", "type", fmt.Sprintf("%T", conditionValues))
+		conditionValueList := toInterfaceSlice(conditionValues, logger)
+		if conditionValueList == nil {
 			return false
 		}
-
 		for _, resourceValue := range resourceValues {
 			resourceStr := fmt.Sprintf("%v", resourceValue)
 			for _, conditionValue := range conditionValueList {
 				conditionStr := fmt.Sprintf("%v", conditionValue)
-
 				if strings.Contains(resourceStr, conditionStr) {
 					foundMatch = append(foundMatch, resourceStr)
 				}
 			}
 		}
-
 		if len(foundMatch) > 0 {
 			logger.Info("Condition violated. Values found in the list", "values", foundMatch)
 			return false
@@ -600,19 +613,10 @@ func handleConditionValidation(operator string, conditionValues interface{}, res
 		return true
 
 	case "In":
-		var conditionValueList []interface{}
-		switch v := conditionValues.(type) {
-		case []string:
-			for _, item := range v {
-				conditionValueList = append(conditionValueList, item)
-			}
-		case []interface{}:
-			conditionValueList = v
-		default:
-			logger.Error(nil, "Unsupported type for conditionValues", "type", fmt.Sprintf("%T", conditionValues))
+		conditionValueList := toInterfaceSlice(conditionValues, logger)
+		if conditionValueList == nil {
 			return false
 		}
-
 		for _, resourceValue := range resourceValues {
 			resourceStr := fmt.Sprintf("%v", resourceValue)
 			for _, conditionValue := range conditionValueList {
@@ -623,13 +627,129 @@ func handleConditionValidation(operator string, conditionValues interface{}, res
 				}
 			}
 		}
-
 		logger.Info("Condition violated. No values found in allowed list")
 		return false
+
+	case "Equals":
+		expected := fmt.Sprintf("%v", conditionValues)
+		for _, resourceValue := range resourceValues {
+			if fmt.Sprintf("%v", resourceValue) == expected {
+				return true
+			}
+		}
+		return false
+
+	case "NotEquals":
+		expected := fmt.Sprintf("%v", conditionValues)
+		for _, resourceValue := range resourceValues {
+			if fmt.Sprintf("%v", resourceValue) == expected {
+				return false
+			}
+		}
+		return true
+
+	case "Regex":
+		pattern, ok := conditionValues.(string)
+		if !ok {
+			logger.Error(nil, "Regex pattern must be a string")
+			return false
+		}
+		re, err := regexp.Compile(pattern)
+		if err != nil {
+			logger.Error(err, "Invalid regex pattern")
+			return false
+		}
+		for _, resourceValue := range resourceValues {
+			if re.MatchString(fmt.Sprintf("%v", resourceValue)) {
+				return true
+			}
+		}
+		return false
+
+	case "GreaterThan", "LessThan", "GreaterThanOrEqual", "LessThanOrEqual":
+		conditionFloat, err := toFloat64(conditionValues)
+		if err != nil {
+			logger.Error(err, "Condition value must be numeric")
+			return false
+		}
+		for _, rv := range resourceValues {
+			resourceFloat, err := toFloat64(rv)
+			if err != nil {
+				continue
+			}
+			switch operator {
+			case "GreaterThan":
+				if resourceFloat > conditionFloat {
+					return true
+				}
+			case "LessThan":
+				if resourceFloat < conditionFloat {
+					return true
+				}
+			case "GreaterThanOrEqual":
+				if resourceFloat >= conditionFloat {
+					return true
+				}
+			case "LessThanOrEqual":
+				if resourceFloat <= conditionFloat {
+					return true
+				}
+			}
+		}
+		return false
+
+	case "Exists":
+		for _, rv := range resourceValues {
+			if rv != nil && fmt.Sprintf("%v", rv) != "" {
+				return true
+			}
+		}
+		return false
+
+	case "NotExists":
+		for _, rv := range resourceValues {
+			if rv != nil && fmt.Sprintf("%v", rv) != "" {
+				return false
+			}
+		}
+		return true
 
 	default:
 		logger.Error(nil, "Unsupported operator", "operator", operator)
 		return false
+	}
+}
+
+func toInterfaceSlice(val interface{}, logger logr.Logger) []interface{} {
+	switch v := val.(type) {
+	case []string:
+		out := make([]interface{}, len(v))
+		for i, s := range v {
+			out[i] = s
+		}
+		return out
+	case []interface{}:
+		return v
+	default:
+		logger.Error(nil, "Unsupported type for conditionValues", "type", fmt.Sprintf("%T", val))
+		return nil
+	}
+}
+
+func toFloat64(val interface{}) (float64, error) {
+	switch v := val.(type) {
+	case int:
+		return float64(v), nil
+	case int64:
+		return float64(v), nil
+	case float64:
+		return v, nil
+	case float32:
+		return float64(v), nil
+	case string:
+		return strconv.ParseFloat(v, 64)
+	default:
+		return 0, fmt.Errorf("cannot convert %T to float64", val)
 	}
 }
 
