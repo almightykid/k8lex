@@ -1,3 +1,4 @@
+// clusterpolicyvalidator_controller.go
 /*
 Copyright 2025.
 
@@ -56,7 +57,7 @@ type ResourceTypeConfig struct {
 type ClusterPolicyValidatorReconciler struct {
 	client.Client
 	Scheme           *runtime.Scheme
-	WatchedResources []ResourceTypeConfig
+	WatchedResources []ResourceTypeConfig // This will be populated by main.go
 }
 
 // Define Prometheus metrics
@@ -139,45 +140,12 @@ func init() {
 // +kubebuilder:rbac:groups=clusterpolicyvalidator.k8lex.io,resources=clusterpolicyvalidators,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=clusterpolicyvalidator.k8lex.io,resources=clusterpolicyvalidators/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=clusterpolicyvalidator.k8lex.io,resources=clusterpolicyvalidators/finalizers,verbs=update
-// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;delete
-// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;delete
-// +kubebuilder:rbac:groups="",resources=persistentvolumes,verbs=get;list;watch;delete
-// +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;delete
-// +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;delete
-// +kubebuilder:rbac:groups="apps",resources=deployments,verbs=get;list;watch;delete;update
-// +kubebuilder:rbac:groups="apps",resources=replicasets,verbs=get;list;watch
-// +kubebuilder:rbac:groups="apps",resources=daemonsets,verbs=get;list;watch;delete
-// +kubebuilder:rbac:groups="apps",resources=statefulsets,verbs=get;list;watch;delete
+// Add dynamic RBAC rules for watched resources (this would typically be generated or inferred by controller-runtime if you use 'watches')
+// +kubebuilder:rbac:groups="",resources=pods;configmaps;persistentvolumes;persistentvolumeclaims;services;secrets;namespaces,verbs=get;list;watch;delete
+// +kubebuilder:rbac:groups="apps",resources=deployments;replicasets;daemonsets;statefulsets,verbs=get;list;watch;delete;update
+// +kubebuilder:rbac:groups="networking.k8s.io",resources=ingresses,verbs=get;list;watch;delete
 
-// GetDefaultWatchedResources returns the default set of resources to watch
-func GetDefaultWatchedResources() []ResourceTypeConfig {
-	return []ResourceTypeConfig{
-		{
-			GVK:    schema.GroupVersionKind{Group: "", Version: "v1", Kind: "Pod"},
-			Object: &v1.Pod{},
-		},
-		{
-			GVK:    schema.GroupVersionKind{Group: "", Version: "v1", Kind: "ConfigMap"},
-			Object: &v1.ConfigMap{},
-		},
-		{
-			GVK:    schema.GroupVersionKind{Group: "", Version: "v1", Kind: "PersistentVolume"},
-			Object: &v1.PersistentVolume{},
-		},
-		{
-			GVK:    schema.GroupVersionKind{Group: "", Version: "v1", Kind: "PersistentVolumeClaim"},
-			Object: &v1.PersistentVolumeClaim{},
-		},
-		{
-			GVK:    schema.GroupVersionKind{Group: "", Version: "v1", Kind: "Service"},
-			Object: &v1.Service{},
-		},
-		{
-			GVK:    schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"},
-			Object: &appsv1.Deployment{},
-		},
-	}
-}
+// REMOVED GetDefaultWatchedResources() as it's no longer used for dynamic watcher setup
 
 // extractValues retrieves values for a given field path from the resource, handling array wildcards (*).
 func extractValues(resource *unstructured.Unstructured, keyPath string) ([]interface{}, error) {
@@ -295,9 +263,21 @@ func (r *ClusterPolicyValidatorReconciler) validateResource(ctx context.Context,
 			continue
 		}
 
+		// Ensure the GVK matches the request's GVK if known, otherwise try getting by NamespacedName
+		// This is a common pattern when you have dynamic watches, but need to resolve the exact type.
+		// If you only watch by GVK, then req.NamespacedName is enough and you use the config.Object
+		// If req.NamespacedName contains GVK info (e.g., from an owner reference event), you can use it.
+		// For a direct watch (EnqueueRequestForObject), req.NamespacedName contains Namespace/Name,
+		// and the object's GVK is known from the watch.
+		// The current loop `for _, config := range r.WatchedResources` is the correct approach
+		// to try and get the resource if its GVK is not directly encoded in the request.
+
 		logger.V(1).Info("Trying resource type", "kind", config.GVK.Kind, "namespacedName", req.NamespacedName)
 
 		tempResource := config.Object.DeepCopyObject().(client.Object)
+		// Set GVK on the temporary resource object to help the client's Get method
+		tempResource.GetObjectKind().SetGroupVersionKind(config.GVK)
+
 		if err := r.Get(ctx, req.NamespacedName, tempResource); err == nil {
 			foundResource = tempResource
 			resourceGVK = config.GVK
@@ -308,8 +288,9 @@ func (r *ClusterPolicyValidatorReconciler) validateResource(ctx context.Context,
 	}
 
 	if foundResource == nil {
-		logger.Info("Resource not found or not watched", "namespacedName", req.NamespacedName)
-		errorTotal.WithLabelValues("resource_not_found_or_not_watched", "unknown").Inc() // Increment new error metric
+		logger.Info("Resource not found or not watched (or error getting it)", "namespacedName", req.NamespacedName)
+		// Increment error if the resource couldn't be found after trying all watched types
+		errorTotal.WithLabelValues("resource_not_found_or_not_watched", "unknown").Inc()
 		return ctrl.Result{}, nil
 	}
 
@@ -894,45 +875,35 @@ func resourcePredicate() predicate.Predicate {
 
 // SetupWithManager sets up the controller with the Manager to watch multiple resource types
 func (r *ClusterPolicyValidatorReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	// Set default watched resources if none specified
-	if len(r.WatchedResources) == 0 {
-		r.WatchedResources = GetDefaultWatchedResources()
-	}
+	// IMPORTANT: r.WatchedResources must already be populated by the caller (main.go)
+	// based on existing ClusterPolicyValidator CRs at startup.
+	// We no longer use GetDefaultWatchedResources() here.
 
-	// Use the builder pattern which is more compatible across versions
 	builder := ctrl.NewControllerManagedBy(mgr).
 		For(&clusterpolicyvalidatorv1alpha1.ClusterPolicyValidator{}).
 		WithOptions(controller.Options{
 			MaxConcurrentReconciles: 2,
 		})
 
-	// Add watches for each resource type
+	// Add watches for each resource type in the dynamically populated WatchedResources list
 	for _, config := range r.WatchedResources {
-		builder = builder.Watches(config.Object, &handler.EnqueueRequestForObject{})
+		// Skip ClusterPolicyValidator itself as it's already watched by For()
+		if config.GVK.Kind == "ClusterPolicyValidator" && config.GVK.Group == clusterpolicyvalidatorv1alpha1.GroupVersion.Group {
+			continue
+		}
+		builder = builder.Watches(
+			config.Object,
+			// EnqueueRequestForObject is generally used for the watched resource itself.
+			// For a policy controller watching other resources, you might want to consider
+			// handler.EnqueueRequestsFromMapFunc to map the watched resource to relevant
+			// ClusterPolicyValidator requests, but for initial dynamic watching, this is fine.
+			&handler.EnqueueRequestForObject{},
+			// You might want to add a predicate here if you only want to reconcile on certain events
+			// e.g., predicate.GenerationChangedPredicate{} for deployments
+		)
 	}
 
 	return builder.Complete(r)
-}
-
-// SetupWithManagerAlternative provides setup with event filtering predicates (alternative approach)
-func (r *ClusterPolicyValidatorReconciler) SetupWithManagerAlternative(mgr ctrl.Manager) error {
-	// Set default watched resources if none specified
-	if len(r.WatchedResources) == 0 {
-		r.WatchedResources = GetDefaultWatchedResources()
-	}
-
-	// Simple approach - watch each resource type separately
-	builder := ctrl.NewControllerManagedBy(mgr).
-		For(&clusterpolicyvalidatorv1alpha1.ClusterPolicyValidator{})
-
-	// Add individual watches
-	for _, config := range r.WatchedResources {
-		builder = builder.Watches(config.Object, &handler.EnqueueRequestForObject{})
-	}
-
-	return builder.WithOptions(controller.Options{
-		MaxConcurrentReconciles: 2,
-	}).Complete(r)
 }
 
 // NewClusterPolicyValidatorReconciler creates a new reconciler with custom watched resources

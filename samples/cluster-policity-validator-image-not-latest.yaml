@@ -5,8 +5,11 @@ metadata:
   namespace: k8lex
 spec:
   description: "Validates that images do not use the 'latest' tag."
-  excludedNamespaces:
-    - kube-system
+  namespaces:
+    exclude:
+      - kube-system
+    include:
+      - k8lex
   validationRules:
     - name: "no-latest-tag"
       description: "Checks that images do not use the 'latest' tag."

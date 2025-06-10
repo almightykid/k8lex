@@ -8,9 +8,11 @@ rules:
   - ""
   resources:
   - configmaps
+  - namespaces
   - persistentvolumeclaims
   - persistentvolumes
   - pods
+  - secrets
   - services
   verbs:
   - delete
@@ -21,29 +23,14 @@ rules:
   - apps
   resources:
   - daemonsets
+  - deployments
+  - replicasets
   - statefulsets
   verbs:
   - delete
   - get
   - list
-  - watch
-- apiGroups:
-  - apps
-  resources:
-  - deployments
-  verbs:
-  - delete
-  - get
-  - list
   - update
-  - watch
-- apiGroups:
-  - apps
-  resources:
-  - replicasets
-  verbs:
-  - get
-  - list
   - watch
 - apiGroups:
   - clusterpolicynotifier.k8lex.io
@@ -149,3 +136,12 @@ rules:
   - get
   - patch
   - update
+- apiGroups:
+  - networking.k8s.io
+  resources:
+  - ingresses
+  verbs:
+  - delete
+  - get
+  - list
+  - watch
