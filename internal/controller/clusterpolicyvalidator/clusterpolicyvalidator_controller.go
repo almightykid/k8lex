@@ -22,6 +22,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time" // Import time for Prometheus timer
 
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
@@ -39,6 +40,8 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/itchyny/gojq"
+	"github.com/prometheus/client_golang/prometheus" // Import Prometheus client library
+	"sigs.k8s.io/controller-runtime/pkg/metrics"     // Import controller-runtime metrics package
 
 	clusterpolicyvalidatorv1alpha1 "github.com/almightykid/k8lex/api/clusterpolicyvalidator/v1alpha1"
 )
@@ -54,6 +57,83 @@ type ClusterPolicyValidatorReconciler struct {
 	client.Client
 	Scheme           *runtime.Scheme
 	WatchedResources []ResourceTypeConfig
+}
+
+// Define Prometheus metrics
+var (
+	// clusterpolicyvalidator_validation_total counts total validation attempts
+	validationAttempts = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "clusterpolicyvalidator_validation_total",
+			Help: "Total number of resources validation attempts by the ClusterPolicyValidator.",
+		},
+	)
+
+	// clusterpolicyvalidator_violations_total counts policy violations, labeled by policy name, resource kind, and severity
+	policyViolations = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "clusterpolicyvalidator_violations_total",
+			Help: "Total number of policy violations detected by the ClusterPolicyValidator.",
+		},
+		[]string{"policy_name", "resource_kind", "severity"},
+	)
+
+	// clusterpolicyvalidator_reconcile_duration_seconds measures the duration of reconcile operations
+	reconcileDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "clusterpolicyvalidator_reconcile_duration_seconds",
+			Help:    "Histogram of reconcile durations for ClusterPolicyValidator.",
+			Buckets: prometheus.DefBuckets, // Default buckets for common use cases
+		},
+		[]string{"controller", "result"}, // Labels for controller name and reconcile result (success/error)
+	)
+
+	// NEW METRIC: clusterpolicyvalidator_policy_evaluation_total counts how many times a policy is evaluated against a resource
+	policyEvaluationTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "clusterpolicyvalidator_policy_evaluation_total",
+			Help: "Total number of times a ClusterPolicyValidator policy was evaluated against a resource.",
+		},
+		[]string{"policy_name", "resource_kind"},
+	)
+
+	// NEW METRIC: clusterpolicyvalidator_action_taken_total counts the total number of actions taken
+	actionTakenTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "clusterpolicyvalidator_action_taken_total",
+			Help: "Total number of actions (block, warn, continue) taken by the ClusterPolicyValidator.",
+		},
+		[]string{"action_type", "resource_kind", "severity"},
+	)
+
+	// NEW METRIC: clusterpolicyvalidator_resource_processed_total counts resources successfully processed
+	resourceProcessedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "clusterpolicyvalidator_resource_processed_total",
+			Help: "Total number of resources successfully processed by the ClusterPolicyValidator reconciler.",
+		},
+		[]string{"resource_kind"},
+	)
+
+	// NEW METRIC: clusterpolicyvalidator_error_total counts specific errors during reconcile/validation
+	errorTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "clusterpolicyvalidator_error_total",
+			Help: "Total number of errors encountered during ClusterPolicyValidator operations.",
+		},
+		[]string{"error_type", "resource_kind"}, // e.g., "failed_get_resource", "failed_list_policies", "failed_extract_values"
+	)
+)
+
+// Register custom metrics with the global Prometheus registry
+func init() {
+	metrics.Registry.MustRegister(validationAttempts)
+	metrics.Registry.MustRegister(policyViolations)
+	metrics.Registry.MustRegister(reconcileDuration)
+	metrics.Registry.MustRegister(policyEvaluationTotal)  // Register new metric
+	metrics.Registry.MustRegister(actionTakenTotal)       // Register new metric
+	metrics.Registry.MustRegister(resourceProcessedTotal) // Register new metric
+	metrics.Registry.MustRegister(errorTotal)             // Register new metric
 }
 
 // +kubebuilder:rbac:groups=clusterpolicyvalidator.k8lex.io,resources=clusterpolicyvalidators,verbs=get;list;watch;create;update;patch;delete
@@ -146,6 +226,16 @@ func evaluateJQ(resource *unstructured.Unstructured, query string) ([]interface{
 func (r *ClusterPolicyValidatorReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
+	// Start timer for reconcile duration
+	// Deferring the ObserveDuration ensures the metric is recorded when the function exits
+	// We'll update the 'result' label inside the function if an error occurs.
+	start := time.Now()
+	reconcileResultLabel := "success" // Default result label
+
+	defer func() {
+		reconcileDuration.WithLabelValues("clusterpolicyvalidator", reconcileResultLabel).Observe(time.Since(start).Seconds())
+	}()
+
 	// Check if this is a ClusterPolicyValidator resource
 	var policy clusterpolicyvalidatorv1alpha1.ClusterPolicyValidator
 	if err := r.Get(ctx, req.NamespacedName, &policy); err == nil {
@@ -157,7 +247,12 @@ func (r *ClusterPolicyValidatorReconciler) Reconcile(ctx context.Context, req ct
 
 	// If not a policy, this should be a resource to validate
 	logger.V(1).Info("Processing non-policy resource", "namespacedName", req.NamespacedName)
-	return r.validateResource(ctx, req, logger)
+	result, err := r.validateResource(ctx, req, logger)
+
+	if err != nil {
+		reconcileResultLabel = "error" // Set result label to error if Reconcile returns an error
+	}
+	return result, err
 }
 
 func namespaceAllowed(resourceNamespace string, nsConfig clusterpolicyvalidatorv1alpha1.Namespace) bool {
@@ -180,6 +275,9 @@ func namespaceAllowed(resourceNamespace string, nsConfig clusterpolicyvalidatorv
 
 // validateResource validates any Kubernetes resource against all ClusterPolicyValidator policies
 func (r *ClusterPolicyValidatorReconciler) validateResource(ctx context.Context, req ctrl.Request, logger logr.Logger) (ctrl.Result, error) {
+	// Increment total validation attempts for any resource that enters this function
+	validationAttempts.Inc()
+
 	// Try to get the resource as unstructured to handle any resource type
 	resource := &unstructured.Unstructured{}
 
@@ -204,12 +302,14 @@ func (r *ClusterPolicyValidatorReconciler) validateResource(ctx context.Context,
 			foundResource = tempResource
 			resourceGVK = config.GVK
 			logger.V(1).Info("Found matching resource", "kind", resourceGVK.Kind, "name", foundResource.GetName())
+			resourceProcessedTotal.WithLabelValues(resourceGVK.Kind).Inc() // Increment new metric
 			break
 		}
 	}
 
 	if foundResource == nil {
 		logger.Info("Resource not found or not watched", "namespacedName", req.NamespacedName)
+		errorTotal.WithLabelValues("resource_not_found_or_not_watched", "unknown").Inc() // Increment new error metric
 		return ctrl.Result{}, nil
 	}
 
@@ -217,6 +317,7 @@ func (r *ClusterPolicyValidatorReconciler) validateResource(ctx context.Context,
 	unstructuredObj, err := runtime.DefaultUnstructuredConverter.ToUnstructured(foundResource)
 	if err != nil {
 		logger.Error(err, "Failed to convert resource to unstructured")
+		errorTotal.WithLabelValues("failed_to_convert_to_unstructured", resourceGVK.Kind).Inc() // Increment new error metric
 		return ctrl.Result{}, err
 	}
 
@@ -229,6 +330,7 @@ func (r *ClusterPolicyValidatorReconciler) validateResource(ctx context.Context,
 	var policies clusterpolicyvalidatorv1alpha1.ClusterPolicyValidatorList
 	if err := r.List(ctx, &policies); err != nil {
 		logger.Error(err, "Failed to list ClusterPolicyValidator")
+		errorTotal.WithLabelValues("failed_to_list_policies", "unknown").Inc() // Increment new error metric
 		return ctrl.Result{}, err
 	}
 
@@ -251,6 +353,9 @@ func (r *ClusterPolicyValidatorReconciler) validateResource(ctx context.Context,
 			"resource", foundResource.GetName(),
 			"kind", resourceGVK.Kind)
 
+		// Increment the policy evaluation metric for each policy evaluated against a resource
+		policyEvaluationTotal.WithLabelValues(policy.Name, resourceGVK.Kind).Inc()
+
 		for _, rule := range policy.Spec.ValidationRules {
 			// Check if this rule applies to this resource type
 			if !r.ruleAppliesToResource(rule, resourceGVK) {
@@ -262,12 +367,14 @@ func (r *ClusterPolicyValidatorReconciler) validateResource(ctx context.Context,
 			for _, condition := range rule.Conditions {
 				if condition.Key == "" {
 					logger.Error(nil, "Key is empty in condition")
+					errorTotal.WithLabelValues("empty_condition_key", resourceGVK.Kind).Inc() // Increment new error metric
 					continue
 				}
 
 				values, err := extractValues(resource, condition.Key)
 				if err != nil {
 					logger.Error(err, "Failed to extract values from resource", "key", condition.Key, "resourceKind", resourceGVK.Kind)
+					errorTotal.WithLabelValues("failed_to_extract_values", resourceGVK.Kind).Inc() // Increment new error metric
 					continue
 				}
 
@@ -286,6 +393,9 @@ func (r *ClusterPolicyValidatorReconciler) validateResource(ctx context.Context,
 			if violated {
 				errorMsg := r.formatErrorMessage(rule.ErrorMessage, foundResource)
 				r.handleResourceAction(ctx, foundResource, resourceGVK.Kind, rule.Action, rule.Severity, errorMsg, logger)
+
+				// Increment policy violation metric
+				policyViolations.WithLabelValues(policy.Name, resourceGVK.Kind, string(rule.Severity)).Inc()
 			}
 		}
 	}
@@ -467,6 +577,9 @@ func (r *ClusterPolicyValidatorReconciler) handleResourceAction(ctx context.Cont
 		"action", action,
 		"error", errorMessage)
 
+	// Increment action taken metric
+	actionTakenTotal.WithLabelValues(action, kind, severity).Inc()
+
 	switch action {
 	case "Block", "block":
 		// Use the controller-runtime client for deletion instead of clientset
@@ -481,6 +594,7 @@ func (r *ClusterPolicyValidatorReconciler) handleResourceAction(ctx context.Cont
 						logger.Info("Pod is managed by ReplicaSet, looking for parent Deployment", "replicaSet", ownerRef.Name)
 						if err := r.handleDeploymentViolation(ctx, namespace, ownerRef.Name, logger); err != nil {
 							logger.Error(err, "Failed to handle deployment violation")
+							errorTotal.WithLabelValues("failed_handle_deployment_violation", kind).Inc() // Increment new error metric
 						}
 						return // Don't delete the pod directly
 					}
@@ -494,6 +608,7 @@ func (r *ClusterPolicyValidatorReconciler) handleResourceAction(ctx context.Cont
 			err := r.Delete(ctx, pod)
 			if err != nil {
 				logger.Error(err, "Failed to delete Pod", "resource", resourceName, "error", errorMessage)
+				errorTotal.WithLabelValues("failed_delete_pod", kind).Inc() // Increment new error metric
 			} else {
 				logger.Info("Pod deleted due to policy violation", "resource", resourceName, "reason", errorMessage)
 			}
@@ -504,6 +619,7 @@ func (r *ClusterPolicyValidatorReconciler) handleResourceAction(ctx context.Cont
 			err := r.Delete(ctx, cm)
 			if err != nil {
 				logger.Error(err, "Failed to delete ConfigMap", "resource", resourceName, "error", errorMessage)
+				errorTotal.WithLabelValues("failed_delete_configmap", kind).Inc() // Increment new error metric
 			} else {
 				logger.Info("ConfigMap deleted due to policy violation", "resource", resourceName, "reason", errorMessage)
 			}
@@ -514,6 +630,7 @@ func (r *ClusterPolicyValidatorReconciler) handleResourceAction(ctx context.Cont
 			err := r.Delete(ctx, pvc)
 			if err != nil {
 				logger.Error(err, "Failed to delete PVC", "resource", resourceName, "error", errorMessage)
+				errorTotal.WithLabelValues("failed_delete_pvc", kind).Inc() // Increment new error metric
 			} else {
 				logger.Info("PVC deleted due to policy violation", "resource", resourceName, "reason", errorMessage)
 			}
@@ -523,6 +640,7 @@ func (r *ClusterPolicyValidatorReconciler) handleResourceAction(ctx context.Cont
 			err := r.Delete(ctx, pv)
 			if err != nil {
 				logger.Error(err, "Failed to delete PV", "resource", resourceName, "error", errorMessage)
+				errorTotal.WithLabelValues("failed_delete_pv", kind).Inc() // Increment new error metric
 			} else {
 				logger.Info("PV deleted due to policy violation", "resource", resourceName, "reason", errorMessage)
 			}
@@ -533,6 +651,7 @@ func (r *ClusterPolicyValidatorReconciler) handleResourceAction(ctx context.Cont
 			err := r.Delete(ctx, svc)
 			if err != nil {
 				logger.Error(err, "Failed to delete Service", "resource", resourceName, "error", errorMessage)
+				errorTotal.WithLabelValues("failed_delete_service", kind).Inc() // Increment new error metric
 			} else {
 				logger.Info("Service deleted due to policy violation", "resource", resourceName, "reason", errorMessage)
 			}
@@ -545,6 +664,7 @@ func (r *ClusterPolicyValidatorReconciler) handleResourceAction(ctx context.Cont
 			// Get the current deployment
 			if err := r.Get(ctx, types.NamespacedName{Name: resourceName, Namespace: namespace}, deployment); err != nil {
 				logger.Error(err, "Failed to get Deployment for scaling", "resource", resourceName)
+				errorTotal.WithLabelValues("failed_get_deployment_for_scaling", kind).Inc() // Increment new error metric
 			} else {
 				originalReplicas := *deployment.Spec.Replicas
 				zero := int32(0)
@@ -560,12 +680,14 @@ func (r *ClusterPolicyValidatorReconciler) handleResourceAction(ctx context.Cont
 
 				if err := r.Update(ctx, deployment); err != nil {
 					logger.Error(err, "Failed to scale down Deployment", "resource", resourceName, "error", errorMessage)
+					errorTotal.WithLabelValues("failed_scale_down_deployment", kind).Inc() // Increment new error metric
 				} else {
 					logger.Info("Deployment scaled down due to policy violation", "resource", resourceName, "originalReplicas", originalReplicas, "reason", errorMessage)
 				}
 			}
 		default:
 			logger.Info("Unsupported resource type for deletion", "kind", kind, "resource", resourceName)
+			errorTotal.WithLabelValues("unsupported_resource_type_for_deletion", kind).Inc() // Increment new error metric
 		}
 	case "warn", "Warn":
 		logger.Info("WARNING: Policy Violation",
@@ -586,6 +708,7 @@ func (r *ClusterPolicyValidatorReconciler) handleResourceAction(ctx context.Cont
 			"kind", kind,
 			"resource", resourceName,
 			"message", errorMessage)
+		errorTotal.WithLabelValues("unknown_policy_action", kind).Inc() // Increment new error metric
 	}
 }
 
