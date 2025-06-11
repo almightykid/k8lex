@@ -236,6 +236,9 @@ func main() {
 		WatchedResources: initialWatchedResources,
 	}
 
+	policyController.FailureMode = clusterpolicyvalidatorcontroller.FailSafe
+	policyController.ConflictResolution = clusterpolicyvalidatorcontroller.ConflictResolutionHighestSeverity
+
 	// Add a background monitor to detect when new resource types are needed
 	if err := mgr.Add(&RestartDetector{
 		Client:             mgr.GetClient(),
