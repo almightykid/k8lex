@@ -6,8 +6,6 @@ metadata:
 spec:
   description: "Validates that images do not use the 'latest' tag."
   namespaces:
-    exclude:
-      - kube-system
     include:
       - k8lex
   validationRules:
@@ -20,10 +18,11 @@ spec:
           - Pod
           - Deployment 
       conditions:
-        - key: spec.containers[*].image
-          operator: "NotIn"
+        # For Deployments, use the correct path
+        - key: spec.template.spec.containers[*].image
+          operator: "Contains"
           values:
-            - "latest"
-      action: "Block"
+            - ":latest"
+      action: "block"  # Note: lowercase 'block'
   notification:
     enabled: false

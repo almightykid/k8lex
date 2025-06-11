@@ -26,6 +26,8 @@ type ClusterPolicyValidatorSpec struct {
 	Namespaces      Namespace        `json:"namespaces,omitempty"`      // List of namespaces to exclude from validation
 	ValidationRules []ValidationRule `json:"validationRules,omitempty"` // List of validation rules
 	Notification    Notification     `json:"notification,omitempty"`    // Notification configuration
+	ErrorMessage    string           `json:"errorMessage,omitempty"`    // Default error message for validation failures
+	Severity        string           `json:"severity,omitempty"`        // Default severity for validation errors
 }
 
 type Namespace struct {

@@ -1,24 +1,9 @@
-/*
-Copyright 2025.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
 package clusterpolicyvalidator
 
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -52,15 +37,26 @@ import (
 
 const (
 	// Constants for annotations
-	PolicyBlockedAnnotation    = "k8lex.io/policy-blocked"
-	OriginalReplicasAnnotation = "k8lex.io/original-replicas"
-	BlockedReasonAnnotation    = "k8lex.io/blocked-reason"
-	PolicyViolationAnnotation  = "k8lex.io/policy-violation"
-	ViolationDetailsAnnotation = "k8lex.io/policy-violation-details"
+	PolicyBlockedAnnotation      = "k8lex.io/policy-blocked"
+	OriginalReplicasAnnotation   = "k8lex.io/original-replicas"
+	BlockedReasonAnnotation      = "k8lex.io/blocked-reason"
+	PolicyViolationAnnotation    = "k8lex.io/policy-violation"
+	ViolationDetailsAnnotation   = "k8lex.io/policy-violation-details"
+	ConflictResolutionAnnotation = "k8lex.io/policy-conflicts"
 
 	// Constants for reconcile behavior
 	DefaultRequeueDelay = 30 * time.Second
 	MaxRetries          = 3
+	JQCacheMaxSize      = 1000
+)
+
+// PolicyConflictResolution defines how to handle policy conflicts
+type PolicyConflictResolution string
+
+const (
+	ConflictResolutionMostRestrictive PolicyConflictResolution = "most-restrictive"
+	ConflictResolutionFirstMatch      PolicyConflictResolution = "first-match"
+	ConflictResolutionHighestSeverity PolicyConflictResolution = "highest-severity"
 )
 
 // ResourceTypeConfig defines configuration for each resource type
@@ -78,6 +74,7 @@ type ValidationResult struct {
 	Severity     string
 	ErrorMessage string
 	ResourcePath string
+	Priority     int // For conflict resolution
 }
 
 // ClusterPolicyValidatorReconciler reconciles a ClusterPolicyValidator object
@@ -95,23 +92,25 @@ type ClusterPolicyValidatorReconciler struct {
 	// Rate limiting for policy evaluations
 	policyEvalLimiter map[string]*time.Timer
 	evalLimiterMu     sync.RWMutex
+
+	// Namespace filtering state - per reconciler instead of global
+	namespaceFilter   *NamespaceFilterState
+	namespaceFilterMu sync.RWMutex
+
+	// Conflict resolution strategy
+	ConflictResolution PolicyConflictResolution
 }
 
 // NamespaceFilterState holds the aggregated namespace filtering rules from all policies.
 type NamespaceFilterState struct {
-	sync.RWMutex
 	IncludedNamespaces map[string]struct{}
 	ExcludedNamespaces map[string]struct{}
 	HasIncludeRules    bool
 	HasExcludeRules    bool
+	LastUpdated        time.Time
 }
 
-var globalNamespaceFilter = &NamespaceFilterState{
-	IncludedNamespaces: make(map[string]struct{}),
-	ExcludedNamespaces: make(map[string]struct{}),
-}
-
-// Prometheus metrics
+// Prometheus metrics (keeping existing ones + new ones)
 var (
 	validationAttempts = prometheus.NewCounter(
 		prometheus.CounterOpts{
@@ -182,6 +181,22 @@ var (
 			Help: "Total number of JQ cache misses.",
 		},
 	)
+
+	namespaceFilteredEvents = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "clusterpolicyvalidator_namespace_filtered_events_total",
+			Help: "Total number of events filtered by namespace rules.",
+		},
+		[]string{"namespace", "action", "reason"},
+	)
+
+	policyConflicts = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "clusterpolicyvalidator_policy_conflicts_total",
+			Help: "Total number of policy conflicts detected.",
+		},
+		[]string{"resolution_strategy", "resource_kind"},
+	)
 )
 
 func init() {
@@ -194,18 +209,21 @@ func init() {
 	metrics.Registry.MustRegister(errorTotal)
 	metrics.Registry.MustRegister(jqCacheHits)
 	metrics.Registry.MustRegister(jqCacheMisses)
+	metrics.Registry.MustRegister(namespaceFilteredEvents)
+	metrics.Registry.MustRegister(policyConflicts)
 }
 
-// UpdateNamespaceFilterState aggregates all namespace rules from existing policies
+// FIXED: UpdateNamespaceFilterState - now per-reconciler instead of global
 func (r *ClusterPolicyValidatorReconciler) UpdateNamespaceFilterState(ctx context.Context) error {
-	globalNamespaceFilter.Lock()
-	defer globalNamespaceFilter.Unlock()
+	r.namespaceFilterMu.Lock()
+	defer r.namespaceFilterMu.Unlock()
 
-	// Clear previous state
-	globalNamespaceFilter.IncludedNamespaces = make(map[string]struct{})
-	globalNamespaceFilter.ExcludedNamespaces = make(map[string]struct{})
-	globalNamespaceFilter.HasIncludeRules = false
-	globalNamespaceFilter.HasExcludeRules = false
+	// Create new state
+	newState := &NamespaceFilterState{
+		IncludedNamespaces: make(map[string]struct{}),
+		ExcludedNamespaces: make(map[string]struct{}),
+		LastUpdated:        time.Now(),
+	}
 
 	var allPolicies clusterpolicyvalidatorv1alpha1.ClusterPolicyValidatorList
 	if err := r.List(ctx, &allPolicies); err != nil {
@@ -213,75 +231,452 @@ func (r *ClusterPolicyValidatorReconciler) UpdateNamespaceFilterState(ctx contex
 		return err
 	}
 
+	r.Log.Info("Updating namespace filter state", "total_policies", len(allPolicies.Items))
+
 	for _, policy := range allPolicies.Items {
+		r.Log.V(2).Info("Processing policy namespace rules",
+			"policy", policy.Name,
+			"include_count", len(policy.Spec.Namespaces.Include),
+			"exclude_count", len(policy.Spec.Namespaces.Exclude))
+
 		if len(policy.Spec.Namespaces.Include) > 0 {
-			globalNamespaceFilter.HasIncludeRules = true
+			newState.HasIncludeRules = true
 			for _, ns := range policy.Spec.Namespaces.Include {
-				globalNamespaceFilter.IncludedNamespaces[ns] = struct{}{}
+				newState.IncludedNamespaces[ns] = struct{}{}
+				r.Log.V(3).Info("Added namespace to include list", "namespace", ns, "policy", policy.Name)
 			}
 		}
 		if len(policy.Spec.Namespaces.Exclude) > 0 {
-			globalNamespaceFilter.HasExcludeRules = true
+			newState.HasExcludeRules = true
 			for _, ns := range policy.Spec.Namespaces.Exclude {
-				globalNamespaceFilter.ExcludedNamespaces[ns] = struct{}{}
+				newState.ExcludedNamespaces[ns] = struct{}{}
+				r.Log.V(3).Info("Added namespace to exclude list", "namespace", ns, "policy", policy.Name)
 			}
 		}
 	}
 
+	// Atomic replacement
+	r.namespaceFilter = newState
+
 	r.Log.Info("Namespace filter state updated",
-		"included_count", len(globalNamespaceFilter.IncludedNamespaces),
-		"excluded_count", len(globalNamespaceFilter.ExcludedNamespaces),
-		"has_include_rules", globalNamespaceFilter.HasIncludeRules,
-		"has_exclude_rules", globalNamespaceFilter.HasExcludeRules,
-	)
+		"included_count", len(newState.IncludedNamespaces),
+		"excluded_count", len(newState.ExcludedNamespaces),
+		"has_include_rules", newState.HasIncludeRules,
+		"has_exclude_rules", newState.HasExcludeRules)
+
 	return nil
 }
 
-// isNamespaceAllowedByPredicate checks if a namespace is allowed based on the current filter state
-func isNamespaceAllowedByPredicate(ns string, logger logr.Logger) bool {
-	globalNamespaceFilter.RLock()
-	defer globalNamespaceFilter.RUnlock()
+// ensureNamespaceFilterInitialized ensures the namespace filter is initialized before use
+func (r *ClusterPolicyValidatorReconciler) ensureNamespaceFilterInitialized(ctx context.Context) error {
+	r.namespaceFilterMu.RLock()
+	if r.namespaceFilter != nil && time.Since(r.namespaceFilter.LastUpdated) < 5*time.Minute {
+		r.namespaceFilterMu.RUnlock()
+		return nil // Recently updated, no need to refresh
+	}
+	r.namespaceFilterMu.RUnlock()
 
-	if globalNamespaceFilter.HasIncludeRules {
-		_, allowed := globalNamespaceFilter.IncludedNamespaces[ns]
-		if !allowed {
-			logger.V(2).Info("Namespace not in include list", "namespace", ns)
-		}
-		return allowed
+	// Need to initialize or refresh
+	return r.UpdateNamespaceFilterState(ctx)
+}
+
+// FIXED: isNamespaceAllowedByPredicate with proper include/exclude precedence
+func (r *ClusterPolicyValidatorReconciler) isNamespaceAllowedByPredicate(ns string, logger logr.Logger) bool {
+	// Lazy initialization - ensure filter is loaded when first used
+	if err := r.ensureNamespaceFilterInitialized(context.Background()); err != nil {
+		logger.Error(err, "Failed to initialize namespace filter, allowing all namespaces")
+		return true // Fail open
 	}
 
-	if globalNamespaceFilter.HasExcludeRules {
-		_, excluded := globalNamespaceFilter.ExcludedNamespaces[ns]
-		if excluded {
-			logger.V(2).Info("Namespace in exclude list", "namespace", ns)
-		}
-		return !excluded
+	r.namespaceFilterMu.RLock()
+	filter := r.namespaceFilter
+	r.namespaceFilterMu.RUnlock()
+
+	if filter == nil {
+		logger.V(2).Info("No namespace filter initialized, allowing all", "namespace", ns)
+		return true
 	}
 
+	// Debug logging
+	logger.V(2).Info("Checking namespace filter",
+		"namespace", ns,
+		"has_include_rules", filter.HasIncludeRules,
+		"has_exclude_rules", filter.HasExcludeRules,
+		"included_namespaces", len(filter.IncludedNamespaces),
+		"excluded_namespaces", len(filter.ExcludedNamespaces))
+
+	// PRECEDENCE RULE: exclude takes absolute precedence over include
+	// If a namespace is in exclude list, it's ALWAYS blocked, regardless of include
+	if filter.HasExcludeRules {
+		if _, excluded := filter.ExcludedNamespaces[ns]; excluded {
+			logger.V(1).Info("Namespace BLOCKED by exclude rule (takes precedence)", "namespace", ns)
+			namespaceFilteredEvents.WithLabelValues(ns, "excluded", "exclude_rule_precedence").Inc()
+			return false
+		}
+	}
+
+	// If we have include rules, namespace must be explicitly included
+	if filter.HasIncludeRules {
+		if _, included := filter.IncludedNamespaces[ns]; included {
+			logger.V(2).Info("Namespace ALLOWED by include rule", "namespace", ns)
+			return true
+		} else {
+			logger.V(1).Info("Namespace NOT in include list, blocked", "namespace", ns)
+			namespaceFilteredEvents.WithLabelValues(ns, "filtered", "not_in_include").Inc()
+			return false
+		}
+	}
+
+	// If only exclude rules exist (no include rules), allow everything not excluded
+	if filter.HasExcludeRules && !filter.HasIncludeRules {
+		logger.V(2).Info("Namespace allowed (not in exclude list)", "namespace", ns)
+		return true
+	}
+
+	// If no rules at all, allow everything
+	logger.V(2).Info("Namespace allowed (no restrictive rules)", "namespace", ns)
 	return true
 }
 
-// namespaceFilteringPredicate returns a predicate that filters events based on namespace rules
-func namespaceFilteringPredicate(logger logr.Logger) predicate.Predicate {
+// FIXED: namespaceFilteringPredicate with better Kind detection
+func (r *ClusterPolicyValidatorReconciler) namespaceFilteringPredicate() predicate.Predicate {
 	return predicate.Funcs{
 		CreateFunc: func(e event.CreateEvent) bool {
-			return isNamespaceAllowedByPredicate(e.Object.GetNamespace(), logger)
+			kind := r.getKindFromObject(e.Object)
+			logger := r.Log.WithValues("event", "create", "kind", kind)
+
+			allowed := r.isNamespaceAllowedByPredicate(e.Object.GetNamespace(), logger)
+			if !allowed {
+				logger.V(1).Info("Create event filtered by namespace",
+					"namespace", e.Object.GetNamespace(),
+					"name", e.Object.GetName(),
+					"kind", kind)
+			}
+			return allowed
 		},
 		UpdateFunc: func(e event.UpdateEvent) bool {
-			// Only reconcile if the spec has changed AND it's allowed by namespace rules
-			if e.ObjectOld != nil && e.ObjectNew != nil &&
-				e.ObjectOld.GetGeneration() == e.ObjectNew.GetGeneration() {
-				return false
+			// Skip if object hasn't actually changed (avoid unnecessary reconciles)
+			if e.ObjectOld != nil && e.ObjectNew != nil {
+				if e.ObjectOld.GetResourceVersion() == e.ObjectNew.GetResourceVersion() {
+					return false
+				}
+				// Only reconcile if the spec has changed OR annotations changed (for our policy annotations)
+				if e.ObjectOld.GetGeneration() == e.ObjectNew.GetGeneration() {
+					oldAnnotations := e.ObjectOld.GetAnnotations()
+					newAnnotations := e.ObjectNew.GetAnnotations()
+
+					// Check if our policy annotations changed
+					oldBlocked := ""
+					newBlocked := ""
+					if oldAnnotations != nil {
+						oldBlocked = oldAnnotations[PolicyBlockedAnnotation]
+					}
+					if newAnnotations != nil {
+						newBlocked = newAnnotations[PolicyBlockedAnnotation]
+					}
+
+					if oldBlocked == newBlocked {
+						return false // No relevant changes
+					}
+				}
 			}
-			return isNamespaceAllowedByPredicate(e.ObjectNew.GetNamespace(), logger)
+
+			kind := r.getKindFromObject(e.ObjectNew)
+			logger := r.Log.WithValues("event", "update", "kind", kind)
+
+			allowed := r.isNamespaceAllowedByPredicate(e.ObjectNew.GetNamespace(), logger)
+			if !allowed {
+				logger.V(1).Info("Update event filtered by namespace",
+					"namespace", e.ObjectNew.GetNamespace(),
+					"name", e.ObjectNew.GetName(),
+					"kind", kind)
+			}
+			return allowed
 		},
 		DeleteFunc: func(e event.DeleteEvent) bool {
-			return isNamespaceAllowedByPredicate(e.Object.GetNamespace(), logger)
+			kind := r.getKindFromObject(e.Object)
+			logger := r.Log.WithValues("event", "delete", "kind", kind)
+
+			allowed := r.isNamespaceAllowedByPredicate(e.Object.GetNamespace(), logger)
+			if !allowed {
+				logger.V(1).Info("Delete event filtered by namespace",
+					"namespace", e.Object.GetNamespace(),
+					"name", e.Object.GetName(),
+					"kind", kind)
+			}
+			return allowed
 		},
 		GenericFunc: func(e event.GenericEvent) bool {
-			return isNamespaceAllowedByPredicate(e.Object.GetNamespace(), logger)
+			kind := r.getKindFromObject(e.Object)
+			logger := r.Log.WithValues("event", "generic", "kind", kind)
+
+			allowed := r.isNamespaceAllowedByPredicate(e.Object.GetNamespace(), logger)
+			if !allowed {
+				logger.V(1).Info("Generic event filtered by namespace",
+					"namespace", e.Object.GetNamespace(),
+					"name", e.Object.GetName(),
+					"kind", kind)
+			}
+			return allowed
 		},
 	}
+}
+
+// getKindFromObject extracts the Kind from various sources
+func (r *ClusterPolicyValidatorReconciler) getKindFromObject(obj client.Object) string {
+	// Try to get Kind from ObjectKind first
+	if gvk := obj.GetObjectKind().GroupVersionKind(); gvk.Kind != "" {
+		return gvk.Kind
+	}
+
+	// Fallback: Use reflection to get the type name
+	objType := reflect.TypeOf(obj)
+	if objType == nil {
+		return "Unknown"
+	}
+
+	// Remove pointer if it's a pointer type
+	if objType.Kind() == reflect.Ptr {
+		objType = objType.Elem()
+	}
+
+	// Get the type name
+	typeName := objType.Name()
+
+	// Handle common k8s types
+	switch typeName {
+	case "Deployment":
+		return "Deployment"
+	case "Pod":
+		return "Pod"
+	case "ReplicaSet":
+		return "ReplicaSet"
+	case "DaemonSet":
+		return "DaemonSet"
+	case "StatefulSet":
+		return "StatefulSet"
+	case "ConfigMap":
+		return "ConfigMap"
+	case "Secret":
+		return "Secret"
+	case "Service":
+		return "Service"
+	case "Ingress":
+		return "Ingress"
+	case "ClusterPolicyValidator":
+		return "ClusterPolicyValidator"
+	default:
+		return typeName
+	}
+}
+
+// NEW: Policy conflict resolution
+func (r *ClusterPolicyValidatorReconciler) resolveConflicts(violations []ValidationResult, logger logr.Logger) []ValidationResult {
+	if len(violations) <= 1 {
+		return violations
+	}
+
+	// Group violations by resource path
+	conflictGroups := make(map[string][]ValidationResult)
+	for _, violation := range violations {
+		key := violation.ResourcePath
+		conflictGroups[key] = append(conflictGroups[key], violation)
+	}
+
+	var resolvedViolations []ValidationResult
+
+	for path, group := range conflictGroups {
+		if len(group) == 1 {
+			resolvedViolations = append(resolvedViolations, group[0])
+			continue
+		}
+
+		// We have conflicts - resolve them
+		logger.Info("Resolving policy conflicts",
+			"resource_path", path,
+			"conflict_count", len(group),
+			"strategy", r.ConflictResolution)
+
+		policyConflicts.WithLabelValues(string(r.ConflictResolution), "unknown").Inc()
+
+		resolved := r.applyConflictResolution(group, logger)
+		resolvedViolations = append(resolvedViolations, resolved...)
+	}
+
+	return resolvedViolations
+}
+
+func (r *ClusterPolicyValidatorReconciler) applyConflictResolution(violations []ValidationResult, logger logr.Logger) []ValidationResult {
+	switch r.ConflictResolution {
+	case ConflictResolutionMostRestrictive:
+		return r.selectMostRestrictive(violations, logger)
+	case ConflictResolutionHighestSeverity:
+		return r.selectHighestSeverity(violations, logger)
+	case ConflictResolutionFirstMatch:
+		fallthrough
+	default:
+		// Return first violation
+		return violations[:1]
+	}
+}
+
+func (r *ClusterPolicyValidatorReconciler) selectMostRestrictive(violations []ValidationResult, logger logr.Logger) []ValidationResult {
+	// Priority: block > warn > audit > continue
+	actionPriority := map[string]int{
+		"block":    4,
+		"warn":     3,
+		"audit":    2,
+		"continue": 1,
+	}
+
+	maxPriority := 0
+	var mostRestrictive []ValidationResult
+
+	for _, violation := range violations {
+		priority := actionPriority[strings.ToLower(violation.Action)]
+		if priority > maxPriority {
+			maxPriority = priority
+			mostRestrictive = []ValidationResult{violation}
+		} else if priority == maxPriority {
+			mostRestrictive = append(mostRestrictive, violation)
+		}
+	}
+
+	logger.Info("Selected most restrictive action",
+		"action", mostRestrictive[0].Action,
+		"selected_count", len(mostRestrictive))
+
+	return mostRestrictive
+}
+
+func (r *ClusterPolicyValidatorReconciler) selectHighestSeverity(violations []ValidationResult, logger logr.Logger) []ValidationResult {
+	// Priority: critical > high > medium > low
+	severityPriority := map[string]int{
+		"critical": 4,
+		"high":     3,
+		"medium":   2,
+		"low":      1,
+	}
+
+	maxPriority := 0
+	var highestSeverity []ValidationResult
+
+	for _, violation := range violations {
+		priority := severityPriority[strings.ToLower(violation.Severity)]
+		if priority > maxPriority {
+			maxPriority = priority
+			highestSeverity = []ValidationResult{violation}
+		} else if priority == maxPriority {
+			highestSeverity = append(highestSeverity, violation)
+		}
+	}
+
+	logger.Info("Selected highest severity",
+		"severity", highestSeverity[0].Severity,
+		"selected_count", len(highestSeverity))
+
+	return highestSeverity
+}
+
+// Cleanup JQ cache to prevent memory leaks
+func (r *ClusterPolicyValidatorReconciler) cleanupJQCache() {
+	r.jqCacheMu.Lock()
+	defer r.jqCacheMu.Unlock()
+
+	if len(r.jqCache) > JQCacheMaxSize {
+		r.Log.Info("Cleaning JQ cache", "current_size", len(r.jqCache), "max_size", JQCacheMaxSize)
+		// Keep half the cache, remove the rest
+		newCache := make(map[string]*gojq.Code)
+		count := 0
+		for k, v := range r.jqCache {
+			if count < JQCacheMaxSize/2 {
+				newCache[k] = v
+				count++
+			}
+		}
+		r.jqCache = newCache
+	}
+}
+
+// Rate limiting implementation
+func (r *ClusterPolicyValidatorReconciler) shouldEvaluatePolicy(policyName string) bool {
+	r.evalLimiterMu.Lock()
+	defer r.evalLimiterMu.Unlock()
+
+	if timer, exists := r.policyEvalLimiter[policyName]; exists {
+		select {
+		case <-timer.C:
+			delete(r.policyEvalLimiter, policyName)
+			return true
+		default:
+			return false // Still rate limited
+		}
+	}
+
+	// Add rate limiting timer (1 second minimum between evaluations)handleControllerBlocking
+	r.policyEvalLimiter[policyName] = time.NewTimer(time.Second)
+	return true
+}
+
+// Keep all your existing methods but update evaluatePolicies to use conflict resolution
+func (r *ClusterPolicyValidatorReconciler) evaluatePolicies(
+	ctx context.Context,
+	resource *unstructured.Unstructured,
+	foundResource client.Object,
+	resourceGVK schema.GroupVersionKind,
+	policies []clusterpolicyvalidatorv1alpha1.ClusterPolicyValidator,
+	logger logr.Logger,
+) []ValidationResult {
+	var violations []ValidationResult
+
+	for _, policy := range policies {
+		if !r.policyAppliesToResource(policy, resourceGVK) {
+			continue
+		}
+
+		// Add rate limiting check
+		if !r.shouldEvaluatePolicy(policy.Name) {
+			logger.V(2).Info("Skipping policy evaluation due to rate limiting", "policy", policy.Name)
+			continue
+		}
+
+		logger.V(1).Info("Evaluating policy",
+			"policy", policy.Name,
+			"resource", foundResource.GetName(),
+			"kind", resourceGVK.Kind)
+
+		policyEvaluationTotal.WithLabelValues(policy.Name, resourceGVK.Kind).Inc()
+
+		for _, rule := range policy.Spec.ValidationRules {
+			if !r.ruleAppliesToResource(rule, resourceGVK) {
+				continue
+			}
+
+			if violation := r.evaluateRule(resource, policy.Name, rule, resourceGVK, logger); violation != nil {
+				violations = append(violations, *violation)
+			}
+		}
+	}
+
+	// Clean up cache periodically
+	r.cleanupJQCache()
+
+	// Apply conflict resolution
+	if len(violations) > 1 {
+		violations = r.resolveConflicts(violations, logger)
+	}
+
+	// Check if any blocking violations exist after conflict resolution
+	for _, violation := range violations {
+		if strings.ToLower(violation.Action) == "block" {
+			logger.Info("Block action encountered after conflict resolution, stopping evaluation",
+				"policy", violation.PolicyName,
+				"rule", violation.RuleName)
+			return []ValidationResult{violation} // Return only the blocking violation
+		}
+	}
+
+	return violations
 }
 
 // getCompiledJQ returns a compiled JQ query from cache or compiles and caches it
@@ -496,51 +891,6 @@ func (r *ClusterPolicyValidatorReconciler) listPolicies(ctx context.Context) ([]
 	return policies.Items, nil
 }
 
-// evaluatePolicies evaluates all applicable policies against a resource
-func (r *ClusterPolicyValidatorReconciler) evaluatePolicies(
-	ctx context.Context,
-	resource *unstructured.Unstructured,
-	foundResource client.Object,
-	resourceGVK schema.GroupVersionKind,
-	policies []clusterpolicyvalidatorv1alpha1.ClusterPolicyValidator,
-	logger logr.Logger,
-) []ValidationResult {
-	var violations []ValidationResult
-
-	for _, policy := range policies {
-		if !r.policyAppliesToResource(policy, resourceGVK) {
-			continue
-		}
-
-		logger.V(1).Info("Evaluating policy",
-			"policy", policy.Name,
-			"resource", foundResource.GetName(),
-			"kind", resourceGVK.Kind)
-
-		policyEvaluationTotal.WithLabelValues(policy.Name, resourceGVK.Kind).Inc()
-
-		for _, rule := range policy.Spec.ValidationRules {
-			if !r.ruleAppliesToResource(rule, resourceGVK) {
-				continue
-			}
-
-			if violation := r.evaluateRule(resource, policy.Name, rule, resourceGVK, logger); violation != nil {
-				violations = append(violations, *violation)
-
-				// If this is a blocking violation, stop processing
-				if strings.ToLower(violation.Action) == "block" {
-					logger.Info("Block action encountered, stopping evaluation",
-						"policy", policy.Name,
-						"rule", rule.Name)
-					return violations
-				}
-			}
-		}
-	}
-
-	return violations
-}
-
 // evaluateRule evaluates a single rule against a resource
 func (r *ClusterPolicyValidatorReconciler) evaluateRule(
 	resource *unstructured.Unstructured,
@@ -549,6 +899,17 @@ func (r *ClusterPolicyValidatorReconciler) evaluateRule(
 	resourceGVK schema.GroupVersionKind,
 	logger logr.Logger,
 ) *ValidationResult {
+
+	if resource == nil {
+		logger.Error(nil, "Resource is nil", "policy", policyName, "rule", rule.Name)
+		return nil
+	}
+
+	if policyName == "" {
+		logger.Error(nil, "Policy name is empty", "rule", rule.Name)
+		return nil
+	}
+
 	for _, condition := range rule.Conditions {
 		if condition.Key == "" {
 			logger.Error(nil, "Empty condition key", "rule", rule.Name, "policy", policyName)
@@ -1050,73 +1411,23 @@ func (r *ClusterPolicyValidatorReconciler) ruleAppliesToResource(
 }
 
 // formatErrorMessage formats the error message with resource context
-func (r *ClusterPolicyValidatorReconciler) formatErrorMessage(template string, resource client.Object) string {
+func (r *ClusterPolicyValidatorReconciler) formatErrorMessage(template string, resource *unstructured.Unstructured) string {
 	if template == "" {
 		return "Resource violates policy"
 	}
 
-	// Simple template replacement
 	message := template
 	message = strings.ReplaceAll(message, "{{ .metadata.name }}", resource.GetName())
 	message = strings.ReplaceAll(message, "{{ .metadata.namespace }}", resource.GetNamespace())
-	message = strings.ReplaceAll(message, "{{ .kind }}", resource.GetObjectKind().GroupVersionKind().Kind)
+
+	// Mejor manera de obtener el Kind
+	kind := resource.GetKind()
+	if kind == "" {
+		kind = "Unknown"
+	}
+	message = strings.ReplaceAll(message, "{{ .kind }}", kind)
 
 	return message
-}
-
-// SetupWithManager sets up the controller with the Manager
-func (r *ClusterPolicyValidatorReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	// Initialize the reconciler
-	r.Log = mgr.GetLogger().WithName("clusterpolicyvalidator-controller")
-	r.EventRecorder = mgr.GetEventRecorderFor("clusterpolicyvalidator-controller")
-
-	// Initialize caches
-	r.jqCache = make(map[string]*gojq.Code)
-	r.policyEvalLimiter = make(map[string]*time.Timer)
-
-	// Initial namespace filter update
-	if err := r.UpdateNamespaceFilterState(context.Background()); err != nil {
-		r.Log.Error(err, "Failed initial namespace filter state update")
-		// Don't fail startup, but log the error
-	}
-
-	// Build the controller
-	builder := ctrl.NewControllerManagedBy(mgr).
-		For(&clusterpolicyvalidatorv1alpha1.ClusterPolicyValidator{}).
-		WithOptions(controller.Options{
-			MaxConcurrentReconciles: 5, // Increased for better throughput
-		})
-
-	// Add watches for dynamic resources with namespace filtering
-	for _, config := range r.WatchedResources {
-		// Skip ClusterPolicyValidator as it's already watched
-		if config.GVK.Kind == "ClusterPolicyValidator" &&
-			config.GVK.Group == clusterpolicyvalidatorv1alpha1.GroupVersion.Group {
-			continue
-		}
-
-		r.Log.Info("Setting up watch with namespace filtering", "GVK", config.GVK)
-		builder = builder.Watches(
-			config.Object,
-			&handler.EnqueueRequestForObject{},
-		).WithEventFilter(namespaceFilteringPredicate(r.Log))
-	}
-	return builder.Complete(r)
-}
-
-// NewClusterPolicyValidatorReconciler creates a new reconciler
-func NewClusterPolicyValidatorReconciler(
-	client client.Client,
-	scheme *runtime.Scheme,
-	watchedResources []ResourceTypeConfig,
-) *ClusterPolicyValidatorReconciler {
-	return &ClusterPolicyValidatorReconciler{
-		Client:            client,
-		Scheme:            scheme,
-		WatchedResources:  watchedResources,
-		jqCache:           make(map[string]*gojq.Code),
-		policyEvalLimiter: make(map[string]*time.Timer),
-	}
 }
 
 // HealthCheck provides a health check endpoint for the controller
@@ -1138,14 +1449,86 @@ func (r *ClusterPolicyValidatorReconciler) GetMetrics() map[string]interface{} {
 	r.jqCacheMu.RLock()
 	defer r.jqCacheMu.RUnlock()
 
+	r.namespaceFilterMu.RLock()
+	defer r.namespaceFilterMu.RUnlock()
+
 	return map[string]interface{}{
 		"jq_cache_size":     len(r.jqCache),
 		"watched_resources": len(r.WatchedResources),
 		"namespace_filter_rules": map[string]interface{}{
-			"included_count": len(globalNamespaceFilter.IncludedNamespaces),
-			"excluded_count": len(globalNamespaceFilter.ExcludedNamespaces),
-			"has_include":    globalNamespaceFilter.HasIncludeRules,
-			"has_exclude":    globalNamespaceFilter.HasExcludeRules,
+			"included_count": len(r.namespaceFilter.IncludedNamespaces),
+			"excluded_count": len(r.namespaceFilter.ExcludedNamespaces),
+			"has_include":    r.namespaceFilter.HasIncludeRules,
+			"has_exclude":    r.namespaceFilter.HasExcludeRules,
+			"last_updated":   r.namespaceFilter.LastUpdated,
+		},
+		"conflict_resolution": r.ConflictResolution,
+	}
+}
+
+// Update SetupWithManager to use the new predicate
+func (r *ClusterPolicyValidatorReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// Initialize the reconciler
+	r.Log = mgr.GetLogger().WithName("clusterpolicyvalidator-controller")
+	r.EventRecorder = mgr.GetEventRecorderFor("clusterpolicyvalidator-controller")
+
+	// Initialize caches and state
+	r.jqCache = make(map[string]*gojq.Code)
+	r.policyEvalLimiter = make(map[string]*time.Timer)
+	r.namespaceFilter = &NamespaceFilterState{
+		IncludedNamespaces: make(map[string]struct{}),
+		ExcludedNamespaces: make(map[string]struct{}),
+	}
+
+	// Set default conflict resolution strategy
+	if r.ConflictResolution == "" {
+		r.ConflictResolution = ConflictResolutionMostRestrictive
+	}
+
+	// Note: Don't update namespace filter state here as the cache isn't started yet
+	// It will be updated on the first policy reconciliation
+
+	// Build the controller
+	builder := ctrl.NewControllerManagedBy(mgr).
+		For(&clusterpolicyvalidatorv1alpha1.ClusterPolicyValidator{}).
+		WithOptions(controller.Options{
+			MaxConcurrentReconciles: 5,
+		})
+
+	// Add watches for dynamic resources with FIXED namespace filtering
+	for _, config := range r.WatchedResources {
+		// Skip ClusterPolicyValidator as it's already watched
+		if config.GVK.Kind == "ClusterPolicyValidator" &&
+			config.GVK.Group == clusterpolicyvalidatorv1alpha1.GroupVersion.Group {
+			continue
+		}
+
+		r.Log.Info("Setting up watch with namespace filtering", "GVK", config.GVK)
+		builder = builder.Watches(
+			config.Object,
+			&handler.EnqueueRequestForObject{},
+		).WithEventFilter(r.namespaceFilteringPredicate()) // Use instance method
+	}
+
+	return builder.Complete(r)
+}
+
+// Update constructor to initialize conflict resolution
+func NewClusterPolicyValidatorReconciler(
+	client client.Client,
+	scheme *runtime.Scheme,
+	watchedResources []ResourceTypeConfig,
+) *ClusterPolicyValidatorReconciler {
+	return &ClusterPolicyValidatorReconciler{
+		Client:             client,
+		Scheme:             scheme,
+		WatchedResources:   watchedResources,
+		jqCache:            make(map[string]*gojq.Code),
+		policyEvalLimiter:  make(map[string]*time.Timer),
+		ConflictResolution: ConflictResolutionMostRestrictive, // Default strategy
+		namespaceFilter: &NamespaceFilterState{
+			IncludedNamespaces: make(map[string]struct{}),
+			ExcludedNamespaces: make(map[string]struct{}),
 		},
 	}
 }

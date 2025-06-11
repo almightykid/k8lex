@@ -22,6 +22,7 @@ import (
 	"flag"
 	"os"
 	"strings"
+	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -93,8 +94,7 @@ func main() {
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
 	// Create a temporary client to list existing ClusterPolicyValidators
-	// to determine the initial set of watched resources.
-	// This client doesn't need to be cached, just for initial setup.
+	// This determines which resources to watch based on EXISTING policies
 	tmpClient, err := client.New(ctrl.GetConfigOrDie(), client.Options{Scheme: scheme})
 	if err != nil {
 		setupLog.Error(err, "unable to create temporary client for initial watcher setup")
@@ -103,50 +103,63 @@ func main() {
 
 	var allPolicies clusterpolicyvalidatorv1alpha1.ClusterPolicyValidatorList
 	if err := tmpClient.List(context.Background(), &allPolicies); err != nil {
-		setupLog.Error(err, "unable to list existing ClusterPolicyValidators for initial watcher setup. Starting with no dynamic watches.")
-		// We'll proceed, but the reconciler might miss events for kinds not in initially loaded policies.
-		// A restart of the operator will be needed if new kinds are added.
+		setupLog.Error(err, "unable to list existing ClusterPolicyValidators for initial watcher setup. Starting with minimal watches.")
 	}
 
-	// Build a map of unique GVKs to watch from existing policies
-	watchedGVKs := make(map[schema.GroupVersionKind]struct{})
-	for _, policy := range allPolicies.Items {
-		for _, rule := range policy.Spec.ValidationRules {
-			for _, kind := range rule.MatchResources.Kinds {
-				gvk := resolveKindToGVK(kind, scheme, setupLog) // Pass scheme to resolveKindToGVK
-				if gvk.Kind != "" {                             // Ensure it's a valid GVK
-					watchedGVKs[gvk] = struct{}{}
-				}
-			}
-		}
-	}
-
+	// Start with ONLY ClusterPolicyValidator watching (for policy changes)
 	var initialWatchedResources []clusterpolicyvalidator.ResourceTypeConfig
-	// Always add the ClusterPolicyValidator itself, it's implicitly watched by .For() but good to list
-	// This specific GVK/Object might not be strictly needed in WatchedResources if it's the For() type
-	// but it ensures it's part of the known resources if needed for other logic.
 	initialWatchedResources = append(initialWatchedResources, clusterpolicyvalidator.ResourceTypeConfig{
 		GVK:    clusterpolicyvalidatorv1alpha1.GroupVersion.WithKind("ClusterPolicyValidator"),
 		Object: &clusterpolicyvalidatorv1alpha1.ClusterPolicyValidator{},
 	})
 
-	for gvk := range watchedGVKs {
-		// Use the scheme to create an empty object for the GVK
-		obj, err := scheme.New(gvk)
-		if err != nil {
-			setupLog.Error(err, "unable to create object for GVK for initial watcher setup", "gvk", gvk)
-			continue // Skip this GVK if we can't create its object
+	// Build a map of unique GVKs to watch from existing policies ONLY
+	watchedGVKs := make(map[schema.GroupVersionKind]struct{})
+	if len(allPolicies.Items) > 0 {
+		setupLog.Info("Found existing policies, adding their resource types to watch list", "policy_count", len(allPolicies.Items))
+
+		for _, policy := range allPolicies.Items {
+			setupLog.Info("Processing existing policy", "policy", policy.Name)
+			for _, rule := range policy.Spec.ValidationRules {
+				for _, kind := range rule.MatchResources.Kinds {
+					gvk := resolveKindToGVK(kind, scheme, setupLog)
+					if gvk.Kind != "" {
+						watchedGVKs[gvk] = struct{}{}
+						setupLog.Info("Added resource type from existing policy", "kind", kind, "gvk", gvk, "policy", policy.Name)
+					}
+				}
+			}
 		}
-		// Ensure the object implements client.Object interface
-		clientObj, ok := obj.(client.Object)
-		if !ok {
-			setupLog.Error(nil, "created object does not implement client.Object", "gvk", gvk)
-			continue
+
+		// Add the discovered GVKs to watch list
+		for gvk := range watchedGVKs {
+			obj, err := scheme.New(gvk)
+			if err != nil {
+				setupLog.Error(err, "unable to create object for GVK from existing policy", "gvk", gvk)
+				continue
+			}
+			clientObj, ok := obj.(client.Object)
+			if !ok {
+				setupLog.Error(nil, "created object does not implement client.Object", "gvk", gvk)
+				continue
+			}
+			initialWatchedResources = append(initialWatchedResources, clusterpolicyvalidator.ResourceTypeConfig{
+				GVK:    gvk,
+				Object: clientObj,
+			})
 		}
-		initialWatchedResources = append(initialWatchedResources, clusterpolicyvalidator.ResourceTypeConfig{
-			GVK:    gvk,
-			Object: clientObj,
-		})
+	} else {
+		setupLog.Info("No existing policies found. Starting with ClusterPolicyValidator watch only.")
+		setupLog.Info("IMPORTANT: When you create policies with new resource types, you'll need to restart the operator to watch those resources.")
+	}
+
+	setupLog.Info("Initial Watched Resources",
+		"count", len(initialWatchedResources),
+		"message", "Only watching resources from existing policies + ClusterPolicyValidator")
+
+	// Print warning if running in minimal mode
+	if len(initialWatchedResources) == 1 {
+		setupLog.Info("🔥 DYNAMIC MODE: Currently watching ClusterPolicyValidator only. Additional resources will be watched when policies are created (requires restart).")
 	}
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
@@ -215,15 +228,30 @@ func main() {
 		setupLog.Error(err, "unable to start manager")
 		os.Exit(1)
 	}
-	setupLog.Info("Initial Watched Resources collected", "resources", initialWatchedResources)
-	if err = (&clusterpolicyvalidatorcontroller.ClusterPolicyValidatorReconciler{
+
+	// Create the ClusterPolicyValidator controller with restart detection capability
+	policyController := &clusterpolicyvalidatorcontroller.ClusterPolicyValidatorReconciler{
 		Client:           mgr.GetClient(),
 		Scheme:           mgr.GetScheme(),
 		WatchedResources: initialWatchedResources,
-	}).SetupWithManager(mgr); err != nil {
+	}
+
+	// Add a background monitor to detect when new resource types are needed
+	if err := mgr.Add(&RestartDetector{
+		Client:             mgr.GetClient(),
+		Log:                setupLog.WithName("restart-detector"),
+		CurrentWatchedGVKs: watchedGVKs,
+		CheckInterval:      30 * time.Second,
+	}); err != nil {
+		setupLog.Error(err, "unable to add restart detector")
+		os.Exit(1)
+	}
+
+	if err = policyController.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "ClusterPolicyValidator")
 		os.Exit(1)
 	}
+
 	if err = (&clusterpolicyupdatercontroller.ClusterPolicyUpdaterReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
@@ -263,24 +291,68 @@ func main() {
 	}
 }
 
-// resolveKindToGVK is a helper function to map simple Kind strings to their full GVKs.
-// This function needs to be exhaustive for all types your operator might watch.
-// It also needs access to the scheme to create empty objects for the GVK.
-func resolveKindToGVK(kind string, scheme *runtime.Scheme, logger logr.Logger) schema.GroupVersionKind {
-	// Loop through all known GVKs in the scheme to find a match
-	for gvk := range scheme.AllKnownTypes() {
-		if gvk.Kind == kind {
-			// Prioritize official core and apps APIs, then custom ones.
-			// This part might need refinement based on your specific needs
-			// if multiple GVKs share the same Kind (e.g., "Deployment" in different groups).
-			// For simplicity, we'll return the first match found.
-			return gvk
+// RestartDetector monitors for new resource types that require a restart
+type RestartDetector struct {
+	Client             client.Client
+	Log                logr.Logger
+	CurrentWatchedGVKs map[schema.GroupVersionKind]struct{}
+	CheckInterval      time.Duration
+}
+
+func (r *RestartDetector) Start(ctx context.Context) error {
+	r.Log.Info("Starting restart detector", "check_interval", r.CheckInterval)
+
+	ticker := time.NewTicker(r.CheckInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			r.Log.Info("Restart detector stopped")
+			return nil
+		case <-ticker.C:
+			if err := r.checkForNewResourceTypes(ctx); err != nil {
+				r.Log.Error(err, "Error checking for new resource types")
+			}
+		}
+	}
+}
+
+func (r *RestartDetector) checkForNewResourceTypes(ctx context.Context) error {
+	var allPolicies clusterpolicyvalidatorv1alpha1.ClusterPolicyValidatorList
+	if err := r.Client.List(ctx, &allPolicies); err != nil {
+		return err
+	}
+
+	// Check if any policies require new resource types
+	for _, policy := range allPolicies.Items {
+		for _, rule := range policy.Spec.ValidationRules {
+			for _, kind := range rule.MatchResources.Kinds {
+				gvk := resolveKindToGVK(kind, runtime.NewScheme(), r.Log)
+				if gvk.Kind != "" {
+					if _, exists := r.CurrentWatchedGVKs[gvk]; !exists {
+						r.Log.Info("🔄 RESTART REQUIRED: New resource type detected in policy",
+							"kind", kind,
+							"gvk", gvk,
+							"policy", policy.Name,
+							"message", "Please restart the operator to watch this resource type")
+
+						// You could implement automatic restart here if desired
+						// For now, just log the requirement
+					}
+				}
+			}
 		}
 	}
 
-	// Manual fallback/specific definitions for common types if scheme lookup isn't enough
-	// or for types not yet added to the scheme via init() but might be configured in policies.
-	switch strings.ToLower(kind) { // Use ToLower to handle case variations
+	return nil
+}
+
+// resolveKindToGVK is a helper function to map simple Kind strings to their full GVKs.
+// This function prioritizes current stable APIs over deprecated ones.
+func resolveKindToGVK(kind string, scheme *runtime.Scheme, logger logr.Logger) schema.GroupVersionKind {
+	// FIRST: Check manual mappings for current stable APIs to avoid deprecated versions
+	switch strings.ToLower(kind) {
 	case "pod":
 		return schema.GroupVersionKind{Group: "", Version: "v1", Kind: "Pod"}
 	case "deployment":
@@ -299,16 +371,117 @@ func resolveKindToGVK(kind string, scheme *runtime.Scheme, logger logr.Logger) s
 		return schema.GroupVersionKind{Group: "", Version: "v1", Kind: "PersistentVolumeClaim"}
 	case "service":
 		return schema.GroupVersionKind{Group: "", Version: "v1", Kind: "Service"}
-	case "secret": // Common to add if you might validate secrets
+	case "secret":
 		return schema.GroupVersionKind{Group: "", Version: "v1", Kind: "Secret"}
-	case "namespace": // Common to add if you might validate namespaces
+	case "namespace":
 		return schema.GroupVersionKind{Group: "", Version: "v1", Kind: "Namespace"}
-	case "ingress": // Assuming networking.k8s.io/v1
+	case "ingress":
 		return schema.GroupVersionKind{Group: "networking.k8s.io", Version: "v1", Kind: "Ingress"}
-		// Add more cases for other specific Kinds you expect to monitor that might not be in the default scheme
-		// or for custom resources you want to watch.
+	case "networkpolicy":
+		return schema.GroupVersionKind{Group: "networking.k8s.io", Version: "v1", Kind: "NetworkPolicy"}
+	case "job":
+		return schema.GroupVersionKind{Group: "batch", Version: "v1", Kind: "Job"}
+	case "cronjob":
+		return schema.GroupVersionKind{Group: "batch", Version: "v1", Kind: "CronJob"}
+	case "horizontalpodautoscaler", "hpa":
+		return schema.GroupVersionKind{Group: "autoscaling", Version: "v2", Kind: "HorizontalPodAutoscaler"}
+	case "role":
+		return schema.GroupVersionKind{Group: "rbac.authorization.k8s.io", Version: "v1", Kind: "Role"}
+	case "clusterrole":
+		return schema.GroupVersionKind{Group: "rbac.authorization.k8s.io", Version: "v1", Kind: "ClusterRole"}
+	case "rolebinding":
+		return schema.GroupVersionKind{Group: "rbac.authorization.k8s.io", Version: "v1", Kind: "RoleBinding"}
+	case "clusterrolebinding":
+		return schema.GroupVersionKind{Group: "rbac.authorization.k8s.io", Version: "v1", Kind: "ClusterRoleBinding"}
+	case "serviceaccount":
+		return schema.GroupVersionKind{Group: "", Version: "v1", Kind: "ServiceAccount"}
+	}
+
+	// SECOND: Look in scheme, but prioritize stable versions
+	var candidates []schema.GroupVersionKind
+	for gvk := range scheme.AllKnownTypes() {
+		if gvk.Kind == kind {
+			candidates = append(candidates, gvk)
+		}
+	}
+
+	if len(candidates) > 0 {
+		// Prioritize by group and version stability
+		best := prioritizeStableGVK(candidates, logger)
+		if best.Kind != "" {
+			return best
+		}
 	}
 
 	logger.Info("Unknown or unresolvable Kind for GVK mapping, skipping", "kind", kind)
 	return schema.GroupVersionKind{} // Return empty GVK for unknown kinds
+}
+
+// prioritizeStableGVK selects the most stable API version from candidates
+func prioritizeStableGVK(candidates []schema.GroupVersionKind, logger logr.Logger) schema.GroupVersionKind {
+	if len(candidates) == 0 {
+		return schema.GroupVersionKind{}
+	}
+
+	// Priority order: prefer stable APIs over beta/alpha, and current groups over deprecated
+	priorities := map[string]int{
+		// Core APIs (highest priority)
+		"v1": 1000,
+
+		// Stable APIs
+		"apps/v1":                      900,
+		"networking.k8s.io/v1":         890,
+		"batch/v1":                     880,
+		"autoscaling/v2":               870,
+		"rbac.authorization.k8s.io/v1": 860,
+		"policy/v1":                    850,
+		"storage.k8s.io/v1":            840,
+
+		// Beta APIs (lower priority)
+		"apps/v1beta1":              500,
+		"apps/v1beta2":              510,
+		"networking.k8s.io/v1beta1": 490,
+		"batch/v1beta1":             480,
+		"autoscaling/v2beta1":       470,
+		"autoscaling/v2beta2":       480,
+
+		// Alpha APIs (lowest priority)
+		"apps/v1alpha1":              100,
+		"networking.k8s.io/v1alpha1": 90,
+
+		// Deprecated APIs (very low priority)
+		"extensions/v1beta1": 10,
+	}
+
+	var best schema.GroupVersionKind
+	bestPriority := -1
+
+	for _, candidate := range candidates {
+		apiVersion := candidate.Group
+		if apiVersion == "" {
+			apiVersion = candidate.Version
+		} else {
+			apiVersion = candidate.Group + "/" + candidate.Version
+		}
+
+		priority, exists := priorities[apiVersion]
+		if !exists {
+			// Unknown API version, give it medium priority
+			priority = 300
+		}
+
+		if priority > bestPriority {
+			bestPriority = priority
+			best = candidate
+		}
+	}
+
+	if best.Kind != "" {
+		logger.V(2).Info("Selected best GVK from candidates",
+			"selected", best,
+			"priority", bestPriority,
+			"total_candidates", len(candidates))
+	}
+
+	return best
 }
