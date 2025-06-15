@@ -8,6 +8,7 @@ import (
 
 	clusterpolicyvalidatorv1alpha1 "github.com/almightykid/k8lex/api/clusterpolicyvalidator/v1alpha1"
 	"github.com/go-logr/logr"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -19,27 +20,67 @@ import (
 // configured in the reconciler. It iterates through the WatchedResources configuration
 // and tries to retrieve the resource specified in the reconcile request.
 func (r *ClusterPolicyValidatorReconciler) findResource(ctx context.Context, req ctrl.Request, logger logr.Logger) (client.Object, schema.GroupVersionKind, error) {
+	logger.V(2).Info("Searching for resource in dynamic GVKs",
+		"namespacedName", req.NamespacedName,
+		"dynamic_gvks_count", len(r.DynamicGVKs))
+
 	// Iterate through all configured watched resource types
-	for _, config := range r.WatchedResources {
+	for gvk := range r.DynamicGVKs {
 		// Skip ClusterPolicyValidator resources to avoid self-validation loops
-		if config.GVK.Kind == "ClusterPolicyValidator" &&
-			config.GVK.Group == clusterpolicyvalidatorv1alpha1.GroupVersion.Group {
+		if gvk.Kind == "ClusterPolicyValidator" &&
+			gvk.Group == clusterpolicyvalidatorv1alpha1.GroupVersion.Group {
+			logger.V(3).Info("Skipping ClusterPolicyValidator GVK to avoid self-validation", "gvk", gvk)
 			continue
 		}
 
-		// Create a deep copy of the resource template to avoid modifying the original
-		tempResource := config.Object.DeepCopyObject().(client.Object)
-		tempResource.GetObjectKind().SetGroupVersionKind(config.GVK)
+		logger.V(3).Info("Trying to find resource as GVK",
+			"gvk", gvk,
+			"namespacedName", req.NamespacedName)
+
+		// Create object for this GVK using the scheme
+		obj, err := r.Scheme.New(gvk)
+		if err != nil {
+			logger.V(3).Info("Failed to create object for GVK", "gvk", gvk, "error", err)
+			continue
+		}
+
+		// Ensure the object implements client.Object
+		clientObj, ok := obj.(client.Object)
+		if !ok {
+			logger.V(3).Info("Object does not implement client.Object", "gvk", gvk)
+			continue
+		}
+
+		// Set the GVK on the object (important for some operations)
+		clientObj.GetObjectKind().SetGroupVersionKind(gvk)
 
 		// Attempt to retrieve the resource from the cluster
-		if err := r.Get(ctx, req.NamespacedName, tempResource); err == nil {
-			logger.V(2).Info("Found matching resource", "kind", config.GVK.Kind, "name", tempResource.GetName())
-			return tempResource, config.GVK, nil
+		if err := r.Get(ctx, req.NamespacedName, clientObj); err == nil {
+			logger.V(2).Info("Found matching resource",
+				"kind", gvk.Kind,
+				"name", clientObj.GetName(),
+				"namespace", clientObj.GetNamespace(),
+				"gvk", gvk)
+			return clientObj, gvk, nil
+		} else if !apierrors.IsNotFound(err) {
+			// Real error (not just NotFound) - log and potentially return error
+			logger.V(3).Info("Error getting resource as GVK", "gvk", gvk, "error", err)
+			// For connectivity issues, we might want to return the error
+			// But for now, we'll continue trying other GVKs
+			continue
+		} else {
+			logger.V(3).Info("Resource not found as GVK", "gvk", gvk)
 		}
 	}
 
+	logger.V(2).Info("Resource not found in any dynamic GVKs",
+		"namespacedName", req.NamespacedName,
+		"searched_gvks", len(r.DynamicGVKs))
+
 	// Increment metrics counter for resources not found or not watched
 	errorTotal.WithLabelValues("resource_not_found_or_not_watched", "unknown").Inc()
+
+	// Return nil if not found in any GVK (this is expected for resources we don't watch)
 	return nil, schema.GroupVersionKind{}, nil
 }
 

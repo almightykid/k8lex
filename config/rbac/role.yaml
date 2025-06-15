@@ -5,32 +5,6 @@ metadata:
   name: manager-role
 rules:
 - apiGroups:
-  - clusterpolicynotifier.k8lex.io
-  resources:
-  - clusterpolicynotifiers
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - clusterpolicynotifier.k8lex.io
-  resources:
-  - clusterpolicynotifiers/finalizers
-  verbs:
-  - update
-- apiGroups:
-  - clusterpolicynotifier.k8lex.io
-  resources:
-  - clusterpolicynotifiers/status
-  verbs:
-  - get
-  - patch
-  - update
-- apiGroups:
   - clusterpolicyset.k8lex.io
   resources:
   - clusterpolicysets
@@ -78,6 +52,32 @@ rules:
   - clusterpolicyupdater.k8lex.io
   resources:
   - clusterpolicyupdaters/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - policies.example.com
+  resources:
+  - clusterpolicynotifiers
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - policies.example.com
+  resources:
+  - clusterpolicynotifiers/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - policies.example.com
+  resources:
+  - clusterpolicynotifiers/status
   verbs:
   - get
   - patch

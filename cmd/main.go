@@ -20,6 +20,7 @@ import (
 	"context"
 	"crypto/tls"
 	"flag"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -47,7 +48,6 @@ import (
 	clusterpolicynotifiercontroller "github.com/almightykid/k8lex/internal/controller/clusterpolicynotifier"
 	clusterpolicysetcontroller "github.com/almightykid/k8lex/internal/controller/clusterpolicyset"
 	clusterpolicyupdatercontroller "github.com/almightykid/k8lex/internal/controller/clusterpolicyupdater"
-	"github.com/almightykid/k8lex/internal/controller/clusterpolicyvalidator"
 	clusterpolicyvalidatorcontroller "github.com/almightykid/k8lex/internal/controller/clusterpolicyvalidator"
 	"github.com/go-logr/logr"
 	// +kubebuilder:scaffold:imports
@@ -55,7 +55,7 @@ import (
 
 var (
 	scheme   = runtime.NewScheme()
-	setupLog = ctrl.Log.WithName("setup")
+	setupLog = ctrl.Log.WithName("main")
 )
 
 func init() {
@@ -94,72 +94,48 @@ func main() {
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
 	// Create a temporary client to list existing ClusterPolicyValidators
-	// This determines which resources to watch based on EXISTING policies
+	// This determines which resources the VALIDATOR needs to watch dynamically
 	tmpClient, err := client.New(ctrl.GetConfigOrDie(), client.Options{Scheme: scheme})
 	if err != nil {
-		setupLog.Error(err, "unable to create temporary client for initial watcher setup")
+		setupLog.Error(err, "unable to create temporary client for validator dynamic setup")
 		os.Exit(1)
 	}
 
 	var allPolicies clusterpolicyvalidatorv1alpha1.ClusterPolicyValidatorList
 	if err := tmpClient.List(context.Background(), &allPolicies); err != nil {
-		setupLog.Error(err, "unable to list existing ClusterPolicyValidators for initial watcher setup. Starting with minimal watches.")
+		setupLog.Error(err, "unable to list existing ClusterPolicyValidators for dynamic setup. Starting with minimal watches.")
 	}
 
-	// Start with ONLY ClusterPolicyValidator watching (for policy changes)
-	var initialWatchedResources []clusterpolicyvalidator.ResourceTypeConfig
-	initialWatchedResources = append(initialWatchedResources, clusterpolicyvalidator.ResourceTypeConfig{
-		GVK:    clusterpolicyvalidatorv1alpha1.GroupVersion.WithKind("ClusterPolicyValidator"),
-		Object: &clusterpolicyvalidatorv1alpha1.ClusterPolicyValidator{},
-	})
+	// Build a map of resource types that the VALIDATOR needs to watch dynamically
+	validatorDynamicGVKs := make(map[schema.GroupVersionKind]struct{})
 
-	// Build a map of unique GVKs to watch from existing policies ONLY
-	watchedGVKs := make(map[schema.GroupVersionKind]struct{})
 	if len(allPolicies.Items) > 0 {
-		setupLog.Info("Found existing policies, adding their resource types to watch list", "policy_count", len(allPolicies.Items))
+		setupLog.Info("Found existing policies, determining dynamic resource types for validator", "policy_count", len(allPolicies.Items))
 
 		for _, policy := range allPolicies.Items {
-			setupLog.Info("Processing existing policy", "policy", policy.Name)
+			setupLog.Info("Processing existing policy for validator dynamic watching", "policy", policy.Name)
 			for _, rule := range policy.Spec.ValidationRules {
 				for _, kind := range rule.MatchResources.Kinds {
 					gvk := resolveKindToGVK(kind, scheme, setupLog)
 					if gvk.Kind != "" {
-						watchedGVKs[gvk] = struct{}{}
-						setupLog.Info("Added resource type from existing policy", "kind", kind, "gvk", gvk, "policy", policy.Name)
+						validatorDynamicGVKs[gvk] = struct{}{}
+						setupLog.Info("Validator will dynamically watch resource type", "kind", kind, "gvk", gvk, "policy", policy.Name)
 					}
 				}
 			}
 		}
-
-		// Add the discovered GVKs to watch list
-		for gvk := range watchedGVKs {
-			obj, err := scheme.New(gvk)
-			if err != nil {
-				setupLog.Error(err, "unable to create object for GVK from existing policy", "gvk", gvk)
-				continue
-			}
-			clientObj, ok := obj.(client.Object)
-			if !ok {
-				setupLog.Error(nil, "created object does not implement client.Object", "gvk", gvk)
-				continue
-			}
-			initialWatchedResources = append(initialWatchedResources, clusterpolicyvalidator.ResourceTypeConfig{
-				GVK:    gvk,
-				Object: clientObj,
-			})
-		}
 	} else {
-		setupLog.Info("No existing policies found. Starting with ClusterPolicyValidator watch only.")
-		setupLog.Info("IMPORTANT: When you create policies with new resource types, you'll need to restart the operator to watch those resources.")
+		setupLog.Info("No existing policies found. Validator will start with minimal dynamic watches.")
+		setupLog.Info("IMPORTANT: When you create policies with new resource types, you'll need to restart the operator for validator to watch those resources.")
 	}
 
-	setupLog.Info("Initial Watched Resources",
-		"count", len(initialWatchedResources),
-		"message", "Only watching resources from existing policies + ClusterPolicyValidator")
+	setupLog.Info("Validator Dynamic Resource Types",
+		"count", len(validatorDynamicGVKs),
+		"message", "Only validator watches these resources dynamically for performance")
 
 	// Print warning if running in minimal mode
-	if len(initialWatchedResources) == 1 {
-		setupLog.Info("🔥 DYNAMIC MODE: Currently watching ClusterPolicyValidator only. Additional resources will be watched when policies are created (requires restart).")
+	if len(validatorDynamicGVKs) == 0 {
+		setupLog.Info("🔥 VALIDATOR DYNAMIC MODE: Currently no dynamic resources to watch. Additional resources will be watched when policies are created (requires restart).")
 	}
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
@@ -229,32 +205,53 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Create the ClusterPolicyValidator controller with restart detection capability
-	policyController := &clusterpolicyvalidatorcontroller.ClusterPolicyValidatorReconciler{
-		Client:           mgr.GetClient(),
-		Scheme:           mgr.GetScheme(),
-		WatchedResources: initialWatchedResources,
+	// Set up controllers - each handles its own resource watching independently
+	setupLog.Info("Setting up controllers with clean separation...")
+
+	// ✅ PRIMERO: Create ClusterPolicyNotifier Controller
+	setupLog.Info("Setting up ClusterPolicyNotifier controller...")
+	notifierController := &clusterpolicynotifiercontroller.ClusterPolicyNotifierReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+		// ✅ AÑADIR HTTPClient para las requests de Slack
+		HTTPClient: &http.Client{
+			Timeout: 30 * time.Second,
+		},
 	}
 
-	policyController.FailureMode = clusterpolicyvalidatorcontroller.FailSafe
-	policyController.ConflictResolution = clusterpolicyvalidatorcontroller.ConflictResolutionHighestSeverity
-
-	// Add a background monitor to detect when new resource types are needed
-	if err := mgr.Add(&RestartDetector{
-		Client:             mgr.GetClient(),
-		Log:                setupLog.WithName("restart-detector"),
-		CurrentWatchedGVKs: watchedGVKs,
-		CheckInterval:      30 * time.Second,
-	}); err != nil {
-		setupLog.Error(err, "unable to add restart detector")
+	if err = notifierController.SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "ClusterPolicyNotifier")
 		os.Exit(1)
 	}
+	setupLog.Info("✅ ClusterPolicyNotifier controller registered")
+
+	// ClusterPolicyValidator Controller (with dynamic watching for performance)
+	policyController := &clusterpolicyvalidatorcontroller.ClusterPolicyValidatorReconciler{
+		Client:             mgr.GetClient(),
+		Scheme:             mgr.GetScheme(),
+		DynamicGVKs:        validatorDynamicGVKs, // Only pass dynamic GVKs it needs,
+		NotifierController: notifierController,
+	}
+	policyController.FailureMode = clusterpolicyvalidatorcontroller.FailSafe
+	policyController.ConflictResolution = clusterpolicyvalidatorcontroller.ConflictResolutionHighestSeverity
 
 	if err = policyController.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "ClusterPolicyValidator")
 		os.Exit(1)
 	}
+	setupLog.Info("✅ ClusterPolicyValidator controller registered with dynamic watching", "dynamic_resources", len(validatorDynamicGVKs))
 
+	// ClusterPolicyNotifier Controller (standard watching - only its own CRD)
+	// if err = (&clusterpolicynotifiercontroller.ClusterPolicyNotifierReconciler{
+	// 	Client: mgr.GetClient(),
+	// 	Scheme: mgr.GetScheme(),
+	// }).SetupWithManager(mgr); err != nil {
+	// 	setupLog.Error(err, "unable to create controller", "controller", "ClusterPolicyNotifier")
+	// 	os.Exit(1)
+	// }
+	// setupLog.Info("✅ ClusterPolicyNotifier controller registered")
+
+	// ClusterPolicyUpdater Controller (standard watching - only its own CRD)
 	if err = (&clusterpolicyupdatercontroller.ClusterPolicyUpdaterReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
@@ -262,6 +259,9 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "ClusterPolicyUpdater")
 		os.Exit(1)
 	}
+	setupLog.Info("✅ ClusterPolicyUpdater controller registered")
+
+	// ClusterPolicySet Controller (standard watching - only its own CRD)
 	if err = (&clusterpolicysetcontroller.ClusterPolicySetReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
@@ -269,13 +269,19 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "ClusterPolicySet")
 		os.Exit(1)
 	}
-	if err = (&clusterpolicynotifiercontroller.ClusterPolicyNotifierReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "ClusterPolicyNotifier")
+	setupLog.Info("✅ ClusterPolicySet controller registered")
+
+	// Add restart detector only for validator's dynamic resources
+	if err := mgr.Add(&ValidatorRestartDetector{
+		Client:             mgr.GetClient(),
+		Log:                setupLog.WithName("validator-restart-detector"),
+		CurrentWatchedGVKs: validatorDynamicGVKs,
+		CheckInterval:      30 * time.Second,
+	}); err != nil {
+		setupLog.Error(err, "unable to add validator restart detector")
 		os.Exit(1)
 	}
+
 	// +kubebuilder:scaffold:builder
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
@@ -287,23 +293,24 @@ func main() {
 		os.Exit(1)
 	}
 
-	setupLog.Info("starting manager")
+	setupLog.Info("starting manager with clean controller separation")
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
 }
 
-// RestartDetector monitors for new resource types that require a restart
-type RestartDetector struct {
+// ValidatorRestartDetector monitors for new resource types that the VALIDATOR needs to watch
+// This is specific to the validator's dynamic watching needs
+type ValidatorRestartDetector struct {
 	Client             client.Client
 	Log                logr.Logger
 	CurrentWatchedGVKs map[schema.GroupVersionKind]struct{}
 	CheckInterval      time.Duration
 }
 
-func (r *RestartDetector) Start(ctx context.Context) error {
-	r.Log.Info("Starting restart detector", "check_interval", r.CheckInterval)
+func (r *ValidatorRestartDetector) Start(ctx context.Context) error {
+	r.Log.Info("Starting validator restart detector", "check_interval", r.CheckInterval)
 
 	ticker := time.NewTicker(r.CheckInterval)
 	defer ticker.Stop()
@@ -311,34 +318,34 @@ func (r *RestartDetector) Start(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			r.Log.Info("Restart detector stopped")
+			r.Log.Info("Validator restart detector stopped")
 			return nil
 		case <-ticker.C:
-			if err := r.checkForNewResourceTypes(ctx); err != nil {
-				r.Log.Error(err, "Error checking for new resource types")
+			if err := r.checkForNewValidatorResourceTypes(ctx); err != nil {
+				r.Log.Error(err, "Error checking for new validator resource types")
 			}
 		}
 	}
 }
 
-func (r *RestartDetector) checkForNewResourceTypes(ctx context.Context) error {
+func (r *ValidatorRestartDetector) checkForNewValidatorResourceTypes(ctx context.Context) error {
 	var allPolicies clusterpolicyvalidatorv1alpha1.ClusterPolicyValidatorList
 	if err := r.Client.List(ctx, &allPolicies); err != nil {
 		return err
 	}
 
-	// Check if any policies require new resource types
+	// Check if any policies require new resource types for the validator
 	for _, policy := range allPolicies.Items {
 		for _, rule := range policy.Spec.ValidationRules {
 			for _, kind := range rule.MatchResources.Kinds {
 				gvk := resolveKindToGVK(kind, runtime.NewScheme(), r.Log)
 				if gvk.Kind != "" {
 					if _, exists := r.CurrentWatchedGVKs[gvk]; !exists {
-						r.Log.Info("🔄 RESTART REQUIRED: New resource type detected in policy",
+						r.Log.Info("🔄 RESTART REQUIRED: Validator needs to watch new resource type",
 							"kind", kind,
 							"gvk", gvk,
 							"policy", policy.Name,
-							"message", "Please restart the operator to watch this resource type")
+							"message", "Please restart the operator for validator to watch this resource type")
 
 						// You could implement automatic restart here if desired
 						// For now, just log the requirement

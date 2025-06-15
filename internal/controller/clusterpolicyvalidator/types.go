@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/almightykid/k8lex/internal/controller/clusterpolicynotifier"
 	"github.com/go-logr/logr"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -133,7 +134,8 @@ type ValidationResult struct {
 	Severity     string
 	ErrorMessage string
 	ResourcePath string
-	Priority     int // For conflict resolution
+	Priority     int
+	Notifier     string
 }
 
 // ClusterPolicyValidatorReconciler reconciles a ClusterPolicyValidator object
@@ -176,6 +178,12 @@ type ClusterPolicyValidatorReconciler struct {
 	// Context for graceful shutdown
 	shutdownCtx context.Context
 	cancel      context.CancelFunc
+
+	// Notification service for policy violations
+	NotifierController *clusterpolicynotifier.ClusterPolicyNotifierReconciler
+
+	// Dynamic GVKs for runtime discovery
+	DynamicGVKs map[schema.GroupVersionKind]struct{}
 }
 
 // NamespaceFilterState holds the aggregated namespace filtering rules from all policies.
@@ -185,4 +193,8 @@ type NamespaceFilterState struct {
 	HasIncludeRules    bool
 	HasExcludeRules    bool
 	LastUpdated        time.Time
+}
+
+type NonRetryableError struct {
+	Err error
 }

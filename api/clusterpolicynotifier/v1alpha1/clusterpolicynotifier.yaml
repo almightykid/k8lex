@@ -1,0 +1,12 @@
+# Slack notification configuration
+apiVersion: policies.example.com/v1alpha1
+kind: ClusterPolicyNotifier
+metadata:
+  name: slack-notifier
+  namespace: k8lex
+  labels:
+    app.kubernetes.io/name: policy-operator
+    app.kubernetes.io/component: notifier
+spec:
+  slackWebhookUrl: "https://hooks.slack.com/services/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"
+  message: "Hola esto es una prueba..."

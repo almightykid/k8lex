@@ -36,17 +36,14 @@ func (r *ClusterPolicyValidatorReconciler) UpdateNamespaceFilterState(ctx contex
 			return err
 		}
 
-		r.Log.Info("Processing namespace rules from all policies",
-			"total_policies", len(allPolicies.Items),
-			"action", "aggregating_namespace_rules")
-
 		// Aggregate namespace rules from each policy to build comprehensive filter state
 		for _, policy := range allPolicies.Items {
-			r.Log.V(2).Info("Processing namespace rules from individual policy",
+			r.Log.Info("Processing namespace filtering for policy",
 				"policy_name", policy.Name,
+				"policy_namespace", policy.Namespace,
+				"policy_generation", policy.Generation,
 				"include_namespaces", len(policy.Spec.Namespaces.Include),
-				"exclude_namespaces", len(policy.Spec.Namespaces.Exclude),
-				"policy_generation", policy.Generation)
+				"exclude_namespaces", len(policy.Spec.Namespaces.Exclude))
 
 			// Process namespace inclusion rules - these define allowed namespaces
 			if len(policy.Spec.Namespaces.Include) > 0 {
@@ -80,8 +77,7 @@ func (r *ClusterPolicyValidatorReconciler) UpdateNamespaceFilterState(ctx contex
 			"included_namespaces", len(newState.IncludedNamespaces),
 			"excluded_namespaces", len(newState.ExcludedNamespaces),
 			"has_include_rules", newState.HasIncludeRules,
-			"has_exclude_rules", newState.HasExcludeRules,
-			"update_timestamp", newState.LastUpdated)
+			"has_exclude_rules", newState.HasExcludeRules)
 
 		return nil
 	}, "api-update-namespace-filter")

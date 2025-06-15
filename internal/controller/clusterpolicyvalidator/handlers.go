@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -55,10 +57,22 @@ func (r *ClusterPolicyValidatorReconciler) handleViolations(
 				"rule", violation.RuleName,
 				"resource", foundResource.GetName(),
 				"kind", resourceGVK.Kind)
+
+			if err := r.SendPolicyViolationNotification(ctx, foundResource.GetName(), violation.RuleName, violation.ErrorMessage); err != nil {
+				logger.Error(err, "Failed to send policy violation notification",
+					"resource", foundResource.GetName(),
+					"policy", violation.PolicyName,
+					"rule", violation.RuleName)
+			} else {
+				logger.Info("Policy violation notification sent successfully",
+					"resource", foundResource.GetName(),
+					"policy", violation.PolicyName)
+			}
+
+			logger.Info("Blocking action taken, no further violations processed for this resource - Notification sent")
 			return ctrl.Result{}, nil // Return an empty result, indicating no requeue is immediately needed.
 		}
 	}
-
 	// After handling all (non-blocking) violations, update the resource's annotations
 	// to reflect the presence and details of any violations. This provides visibility
 	// into the resource's policy compliance state.
@@ -229,6 +243,7 @@ func (r *ClusterPolicyValidatorReconciler) handleControllerBlocking(
 			"kind", unstructuredObj.GetKind(),
 			"resource", resource.GetName(),
 			"namespace", resource.GetNamespace())
+
 	} else {
 		// Scale the resource down to 0 replicas.
 		if err := unstructured.SetNestedField(unstructuredObj.Object, int64(0), "spec", "replicas"); err != nil {
@@ -265,6 +280,23 @@ func (r *ClusterPolicyValidatorReconciler) handleControllerBlocking(
 			"resource", resource.GetName(),
 			"namespace", resource.GetNamespace())
 		errorTotal.WithLabelValues("failed_scale_down_and_annotate", unstructuredObj.GetKind()).Inc()
+		return err
+	}
+
+	if err := r.Update(ctx, unstructuredObj); err != nil {
+		if apierrors.IsConflict(err) {
+			logger.Info("Resource update conflict - controller will retry automatically",
+				"kind", unstructuredObj.GetKind(),
+				"resource", resource.GetName(),
+				"namespace", resource.GetNamespace(),
+				"behavior", "automatic_retry_by_controller_runtime")
+		} else {
+			logger.Error(err, "Failed to update resource (non-conflict error)",
+				"kind", unstructuredObj.GetKind(),
+				"resource", resource.GetName(),
+				"namespace", resource.GetNamespace())
+			errorTotal.WithLabelValues("failed_scale_down_and_annotate", unstructuredObj.GetKind()).Inc()
+		}
 		return err
 	}
 

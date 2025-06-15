@@ -12,7 +12,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/go-logr/logr"
 
@@ -98,8 +97,8 @@ func (r *ClusterPolicyValidatorReconciler) initializeIfNeeded() {
 // It sets up dynamic resource watching, optimized event filtering, and background maintenance tasks
 func (r *ClusterPolicyValidatorReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// Initialize structured logging with controller-specific context
-	r.Log = mgr.GetLogger().WithName("clusterpolicyvalidator-controller")
-	r.EventRecorder = mgr.GetEventRecorderFor("clusterpolicyvalidator-controller")
+	r.Log = mgr.GetLogger().WithName("validator-controller")
+	r.EventRecorder = mgr.GetEventRecorderFor("validator-controller")
 
 	// Ensure all enhanced features are properly initialized
 	r.initializeIfNeeded()
@@ -122,25 +121,41 @@ func (r *ClusterPolicyValidatorReconciler) SetupWithManager(mgr ctrl.Manager) er
 		})
 
 	// Set up dynamic resource watches with intelligent event filtering
-	for _, config := range r.WatchedResources {
+	for gvk := range r.DynamicGVKs {
 		// Skip ClusterPolicyValidator as it's already being watched by the For() clause above
-		if config.GVK.Kind == "ClusterPolicyValidator" &&
-			config.GVK.Group == clusterpolicyvalidatorv1alpha1.GroupVersion.Group {
+		if gvk.Kind == "ClusterPolicyValidator" &&
+			gvk.Group == clusterpolicyvalidatorv1alpha1.GroupVersion.Group {
 			continue
 		}
 
 		r.Log.Info("Configuring enhanced resource watch with optimized event filtering",
-			"group", config.GVK.Group,
-			"version", config.GVK.Version,
-			"kind", config.GVK.Kind,
+			"group", gvk.Group,
+			"version", gvk.Version,
+			"kind", gvk.Kind,
 			"features", "namespace_filtering,generation_tracking,bypass_detection")
+
+		// Create object for this GVK
+		obj, err := mgr.GetScheme().New(gvk)
+		if err != nil {
+			r.Log.Error(err, "Failed to create object for GVK", "gvk", gvk)
+			continue
+		}
+
+		clientObj, ok := obj.(client.Object)
+		if !ok {
+			r.Log.Error(nil, "Object does not implement client.Object", "gvk", gvk)
+			continue
+		}
 
 		// Add watch with optimized predicates to reduce unnecessary reconciliations
 		builder = builder.Watches(
-			config.Object,
+			clientObj,
 			&handler.EnqueueRequestForObject{},
 		).WithEventFilter(r.optimizedEventFilter())
 	}
+
+	r.Log.Info("Dynamic resource watches configured successfully",
+		"total_dynamic_resources", len(r.DynamicGVKs))
 
 	// Complete controller setup and register with the manager
 	return builder.Complete(r)
@@ -150,8 +165,7 @@ func (r *ClusterPolicyValidatorReconciler) SetupWithManager(mgr ctrl.Manager) er
 // This method handles both policy configuration changes and resource validation requests with enterprise-grade
 // reliability patterns including circuit breakers, exponential backoff, and comprehensive observability
 func (r *ClusterPolicyValidatorReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	logger := log.FromContext(ctx).WithValues("ClusterPolicyValidator", req.NamespacedName)
-	r.Log = logger
+	logger := r.Log
 
 	// Ensure all enhanced features are initialized before processing any requests
 	r.initializeIfNeeded()
@@ -169,20 +183,14 @@ func (r *ClusterPolicyValidatorReconciler) Reconcile(ctx context.Context, req ct
 			"result", reconcileResultLabel)
 	}()
 
-	// Attempt to fetch ClusterPolicyValidator resource with retry logic and circuit breaker protection
 	policy := &clusterpolicyvalidatorv1alpha1.ClusterPolicyValidator{}
 
-	err := r.retryWithBackoff(ctx, func() error {
-		return r.Get(ctx, req.NamespacedName, policy)
-	}, "api-get-policy")
+	quickErr := r.Get(ctx, req.NamespacedName, policy)
 
-	if err == nil {
-		// This reconciliation is for a policy configuration change
-		logger.Info("Processing ClusterPolicyValidator policy configuration change",
+	if quickErr == nil {
+		logger.Info("👀 ClusterPolicyValidator policy configuration registered",
 			"policy_name", policy.Name,
-			"generation", policy.Generation,
-			"resource_version", policy.ResourceVersion,
-			"action", "updating_system_state")
+			"generation", policy.Generation)
 
 		// Invalidate policy cache to ensure fresh policy data for subsequent evaluations
 		if r.policyCache != nil {
@@ -190,52 +198,86 @@ func (r *ClusterPolicyValidatorReconciler) Reconcile(ctx context.Context, req ct
 			logger.V(2).Info("Policy cache invalidated due to policy configuration change")
 		}
 
-		// Update namespace filtering rules based on new policy configuration
-		if err := r.UpdateNamespaceFilterState(ctx); err != nil {
+		// Update namespace filtering rules with retry protection for API calls
+		updateErr := r.retryWithBackoff(ctx, func() error {
+			return r.UpdateNamespaceFilterState(ctx)
+		}, "api-update-namespace-filter")
+
+		if updateErr != nil {
 			reconcileResultLabel = "error"
-			logger.Error(err, "Failed to update namespace filter state after policy change")
-			return ctrl.Result{RequeueAfter: r.calculateBackoffDelay(1)}, err
+			logger.Error(updateErr, "Failed to update namespace filter state after policy change")
+			return ctrl.Result{RequeueAfter: r.calculateBackoffDelay(1)}, updateErr
 		}
 
-		logger.Info("Policy configuration change processed successfully",
+		logger.Info("👍🏼 Policy configuration change processed successfully",
 			"policy_name", policy.Name)
 		return ctrl.Result{}, nil
-	}
 
-	// Handle non-NotFound errors with appropriate retry logic
-	if !apierrors.IsNotFound(err) {
-		logger.Error(err, "Failed to fetch ClusterPolicyValidator resource - will retry with backoff")
-		reconcileResultLabel = "error"
-		return ctrl.Result{RequeueAfter: r.calculateBackoffDelay(1)}, err
-	}
+	} else if apierrors.IsNotFound(quickErr) {
+		// EXPECTED: This is NOT a ClusterPolicyValidator - it's a resource validation request
+		logger.V(1).Info("Processing resource validation request",
+			"namespacedName", req.NamespacedName,
+			"action", "validating_resource_against_policies")
 
-	// This is a resource validation request (policy resource was not found)
-	logger.V(1).Info("Processing resource validation request",
-		"namespacedName", req.NamespacedName,
-		"action", "validating_resource_against_policies")
+		// Execute resource validation with existing retry protection
+		result, err := r.validateResource(ctx, req, logger)
 
-	// Execute resource validation with enhanced error handling and performance optimizations
-	result, err := r.validateResource(ctx, req, logger)
+		if err != nil {
+			reconcileResultLabel = "error"
+			delay := r.calculateBackoffDelay(1)
+			if apierrors.IsServiceUnavailable(err) || apierrors.IsTimeout(err) {
+				delay = r.calculateBackoffDelay(2)
+				logger.Info("Server-side error detected - using extended backoff delay",
+					"error_type", fmt.Sprintf("%T", err),
+					"delay", delay)
+			}
 
-	if err != nil {
-		reconcileResultLabel = "error"
-
-		// Calculate appropriate backoff delay based on error type for intelligent retry behavior
-		delay := r.calculateBackoffDelay(1)
-		if apierrors.IsServiceUnavailable(err) || apierrors.IsTimeout(err) {
-			delay = r.calculateBackoffDelay(2) // Longer delay for server-side issues
-			logger.Info("Server-side error detected - using extended backoff delay",
-				"error_type", fmt.Sprintf("%T", err),
-				"delay", delay)
+			logger.Error(err, "Resource validation failed - will retry with backoff",
+				"delay", delay,
+				"error_type", fmt.Sprintf("%T", err))
+			return ctrl.Result{RequeueAfter: delay}, err
 		}
 
-		logger.Error(err, "Resource validation failed - will retry with backoff",
-			"delay", delay,
-			"error_type", fmt.Sprintf("%T", err))
-		return ctrl.Result{RequeueAfter: delay}, err
-	}
+		return result, nil
 
-	return result, nil
+	} else {
+		// REAL ERROR: API connectivity issues - use retry system for real errors only
+		logger.Info("API error during type determination - applying retry protection",
+			"error_type", fmt.Sprintf("%T", quickErr))
+
+		retryErr := r.retryWithBackoff(ctx, func() error {
+			return r.Get(ctx, req.NamespacedName, policy)
+		}, "api-connectivity-retry")
+
+		if retryErr == nil {
+			// Retry succeeded - process as policy
+			logger.Info("👀 ClusterPolicyValidator found after connectivity retry",
+				"policy_name", policy.Name,
+				"generation", policy.Generation)
+
+			// Process policy change (same logic as above)
+			if r.policyCache != nil {
+				r.policyCache = NewLRUCache(100)
+			}
+
+			updateErr := r.retryWithBackoff(ctx, func() error {
+				return r.UpdateNamespaceFilterState(ctx)
+			}, "api-update-namespace-filter-retry")
+
+			if updateErr != nil {
+				reconcileResultLabel = "error"
+				return ctrl.Result{RequeueAfter: r.calculateBackoffDelay(1)}, updateErr
+			}
+
+			logger.Info("👍🏼 Policy configuration change processed successfully after retry",
+				"policy_name", policy.Name)
+			return ctrl.Result{}, nil
+		} else {
+			reconcileResultLabel = "error"
+			logger.Error(retryErr, "Failed to determine resource type after connectivity retry")
+			return ctrl.Result{RequeueAfter: r.calculateBackoffDelay(1)}, retryErr
+		}
+	}
 }
 
 // validateResource performs comprehensive resource validation with enhanced error handling and performance optimization
@@ -268,12 +310,13 @@ func (r *ClusterPolicyValidatorReconciler) validateResource(ctx context.Context,
 	if foundResource == nil {
 		logger.V(2).Info("Resource not found in watched resource types - skipping validation",
 			"namespacedName", req.NamespacedName,
-			"watched_types", len(r.WatchedResources))
+			"watched_types", len(r.DynamicGVKs))
 		return ctrl.Result{}, nil
 	}
 
 	// Record successful resource processing metrics
 	resourceProcessedTotal.WithLabelValues(resourceGVK.Kind).Inc()
+
 	logger.Info("Resource discovered successfully for validation",
 		"resource_kind", resourceGVK.Kind,
 		"resource_name", foundResource.GetName(),
@@ -439,7 +482,7 @@ func (r *ClusterPolicyValidatorReconciler) GetMetrics() map[string]interface{} {
 			"policy_breaker_state": 0, // Will be updated by Prometheus metrics
 		},
 		"configuration": map[string]interface{}{
-			"watched_resources":    len(r.WatchedResources),
+			"watched_resources":    len(r.DynamicGVKs),
 			"failure_mode":         r.FailureMode,
 			"conflict_resolution":  r.ConflictResolution,
 			"max_retries":          r.retryConfig.MaxRetries,
@@ -490,4 +533,12 @@ func (r *ClusterPolicyValidatorReconciler) HealthCheck() error {
 		"configuration_valid", true)
 
 	return nil
+}
+
+func (e *NonRetryableError) Error() string {
+	return e.Err.Error()
+}
+
+func (e *NonRetryableError) Unwrap() error {
+	return e.Err
 }
