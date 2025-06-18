@@ -202,6 +202,12 @@ func (r *ClusterPolicyValidatorReconciler) evaluatePoliciesInternal(
 				continue
 			}
 
+			logger.V(1).Info("Evaluating rule",
+				"policy", policy.Name,
+				"rule", rule.Name,
+				"resource", foundResource.GetName(),
+				"kind", resourceGVK.Kind)
+
 			// Evaluate the individual rule against the resource.
 			if violation := r.evaluateRule(resource, policy.Name, rule, resourceGVK, logger); violation != nil {
 				// If a violation is detected, add it to the list of detected violations.
@@ -249,6 +255,12 @@ func (r *ClusterPolicyValidatorReconciler) evaluateRule(
 	logger logr.Logger,
 ) *ValidationResult {
 
+	logger.V(1).Info("Evaluating rule",
+		"policy", policyName,
+		"rule", rule.Name,
+		"resource", resource.GetName(),
+		"kind", resourceGVK.Kind)
+
 	// Basic nil checks for robustness.
 	if resource == nil {
 		logger.Error(nil, "Resource is nil when evaluating rule", "policy", policyName, "rule", rule.Name)
@@ -261,6 +273,14 @@ func (r *ClusterPolicyValidatorReconciler) evaluateRule(
 
 	// Iterate through each condition defined within the rule.
 	for _, condition := range rule.Conditions {
+
+		logger.V(1).Info("Evaluating condition",
+			"policy", policyName,
+			"rule", rule.Name,
+			"condition", condition.Key,
+			"resource", resource.GetName(),
+			"kind", resourceGVK.Kind)
+
 		// Validate that the condition key is not empty.
 		if condition.Key == "" {
 			logger.Error(nil, "Empty condition key found in rule", "rule", rule.Name, "policy", policyName)
@@ -278,9 +298,17 @@ func (r *ClusterPolicyValidatorReconciler) evaluateRule(
 			continue
 		}
 
+		logger.V(1).Info("Values extracted for condition",
+			"policy", policyName,
+			"rule", rule.Name,
+			"condition", condition.Key,
+			"values", values,
+			"resource", resource.GetName(),
+			"kind", resourceGVK.Kind)
+
 		// Validate the extracted values against the condition's operator and expected values.
 		// If the validation fails, a violation is detected.
-		if !r.validateCondition(condition, values, logger) {
+		if r.validateCondition(condition, values, logger) {
 			logger.Info("Rule violation detected",
 				"policy", policyName,
 				"rule", rule.Name,
@@ -301,6 +329,14 @@ func (r *ClusterPolicyValidatorReconciler) evaluateRule(
 				ResourcePath: condition.Key,                                     // The JQ path that caused the violation.
 			}
 		}
+
+		logger.V(1).Info("Condition validated",
+			"policy", policyName,
+			"rule", rule.Name,
+			"condition", condition.Key,
+			"values", values,
+			"resource", resource.GetName(),
+			"kind", resourceGVK.Kind)
 	}
 
 	return nil // No violations found for this rule.
@@ -315,6 +351,12 @@ func (r *ClusterPolicyValidatorReconciler) validateCondition(
 	actualValues []interface{}, // The values extracted from the resource.
 	logger logr.Logger, // Logger for detailed debugging.
 ) bool {
+
+	logger.V(1).Info("Validating condition",
+		"operator", condition.Operator,
+		"expectedValues", condition.Values,
+		"actualValues", actualValues)
+
 	// Handle special cases for empty or non-existent values.
 	if len(actualValues) == 0 {
 		logger.V(2).Info("No values extracted for condition. Checking for IsEmpty/IsNotEmpty operator.",
@@ -323,6 +365,11 @@ func (r *ClusterPolicyValidatorReconciler) validateCondition(
 		// If no values are found, "IsEmpty" is true, and other operators are false.
 		return condition.Operator == "IsEmpty"
 	}
+
+	logger.V(1).Info("Validating condition",
+		"operator", condition.Operator,
+		"expectedValues", condition.Values,
+		"actualValues", actualValues)
 
 	// Handle "IsEmpty" and "IsNotEmpty" operators first as they don't depend on actual values.
 	switch condition.Operator {
@@ -339,12 +386,26 @@ func (r *ClusterPolicyValidatorReconciler) validateCondition(
 	for _, actualVal := range actualValues {
 		actualStr := fmt.Sprintf("%v", actualVal) // Convert the actual value to string for comparison.
 
+		logger.V(1).Info("Evaluating actual value",
+			"actualValue", actualStr,
+			"operator", condition.Operator,
+			"expectedValues", condition.Values)
+
 		if len(condition.Values) > 0 {
 			// If expected values are provided, check if any of them match.
 			matchFound := false
 			for _, expectedVal := range condition.Values {
+				logger.V(1).Info("Evaluating expected value",
+					"expectedValue", expectedVal,
+					"operator", condition.Operator,
+					"actualValue", actualStr)
+
 				if r.evaluateSingleCondition(actualStr, condition.Operator, expectedVal, logger) {
 					matchFound = true
+					logger.V(1).Info("Match found for actual value against expected values for condition",
+						"actualValue", actualStr,
+						"operator", condition.Operator,
+						"expectedValues", condition.Values)
 					break // Found a match for this actual value, no need to check other expected values.
 				}
 			}
@@ -362,6 +423,12 @@ func (r *ClusterPolicyValidatorReconciler) validateCondition(
 			return false
 		}
 	}
+
+	logger.V(1).Info("Condition validated",
+		"operator", condition.Operator,
+		"expectedValues", condition.Values,
+		"actualValues", actualValues,
+		"result", true)
 
 	// If all actual values (or at least one for "OR" type conditions implicitly handled by for-loop)
 	// passed the evaluation against the expected values, the condition is met.
