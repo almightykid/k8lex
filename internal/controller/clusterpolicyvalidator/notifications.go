@@ -3,11 +3,17 @@ package clusterpolicyvalidator
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
-// ✅ Método simple para enviar notificación de violación
+const (
+	defaultNotifier = "slack-notifier"
+)
+
+// SendPolicyViolationNotification sends a notification when a resource violates a policy rule.
+// It includes details about the resource, the violated rule, and the reason for the violation.
 func (r *ClusterPolicyValidatorReconciler) SendPolicyViolationNotification(ctx context.Context, resourceName, ruleName, reason string) error {
 	logger := log.FromContext(ctx)
 
@@ -16,8 +22,7 @@ func (r *ClusterPolicyValidatorReconciler) SendPolicyViolationNotification(ctx c
 		return nil
 	}
 
-	// ✅ Crear mensaje simple según tu formato
-	message := fmt.Sprintf("🚨 Bloqueando recurso %s porque incumple con la regla %s\n\nMotivo: %s",
+	message := fmt.Sprintf("🚨 Blocking resource %s due to violation of rule %s\n\nReason: %s",
 		resourceName, ruleName, reason)
 
 	logger.Info("Sending policy violation notification",
@@ -25,18 +30,17 @@ func (r *ClusterPolicyValidatorReconciler) SendPolicyViolationNotification(ctx c
 		"rule", ruleName,
 		"message", message)
 
-	// ✅ Enviar usando el notifier controller simple
-	// Usamos "slack-notifier" como nombre predeterminado según tu ejemplo
-	return r.NotifierController.SendMessage(ctx, "slack-notifier", message)
+	if err := r.NotifierController.SendMessage(ctx, defaultNotifier, message); err != nil {
+		logger.Error(err, "Failed to send policy violation notification")
+		return fmt.Errorf("failed to send notification: %w", err)
+	}
+	return nil
 }
 
-// ✅ Método para enviar notificación personalizada
+// SendCustomNotification sends a custom notification using the specified notifier.
+// This is a generic method that can be used for any type of notification.
 func (r *ClusterPolicyValidatorReconciler) SendCustomNotification(ctx context.Context, notifierName, message string) error {
 	logger := log.FromContext(ctx)
-
-	logger.Info("Sending custom notification",
-		"notifier", notifierName,
-		"message", message)
 
 	if r.NotifierController == nil {
 		logger.Info("NotifierController not configured, skipping notification")
@@ -47,26 +51,34 @@ func (r *ClusterPolicyValidatorReconciler) SendCustomNotification(ctx context.Co
 		"notifier", notifierName,
 		"message", message)
 
-	return r.NotifierController.SendMessage(ctx, notifierName, message)
+	if err := r.NotifierController.SendMessage(ctx, notifierName, message); err != nil {
+		logger.Error(err, "Failed to send custom notification")
+		return fmt.Errorf("failed to send notification: %w", err)
+	}
+	return nil
 }
 
-// ✅ Método para notificar bloqueo de recurso
+// NotifyResourceBlocked sends a notification when a resource is blocked due to policy violation.
+// It includes comprehensive information about the blocked resource, including its kind,
+// name, the violated rule, and the reason for blocking.
 func (r *ClusterPolicyValidatorReconciler) NotifyResourceBlocked(ctx context.Context, resourceName, resourceKind, ruleName, reason string) error {
 	fullResourceName := fmt.Sprintf("%s/%s", resourceKind, resourceName)
-	message := fmt.Sprintf("🚫 Bloqueando recurso %s porque incumple con la regla %s\n\n📋 Motivo: %s\n🕐 Timestamp: %s",
-		fullResourceName, ruleName, reason, ctx.Value("timestamp"))
+	message := fmt.Sprintf("🚫 Blocking resource %s due to violation of rule %s\n\n📋 Reason: %s\n🕐 Timestamp: %s",
+		fullResourceName, ruleName, reason, time.Now().Format(time.RFC3339))
 
-	return r.SendCustomNotification(ctx, "slack-notifier", message)
+	return r.SendCustomNotification(ctx, defaultNotifier, message)
 }
 
-// ✅ Método para notificar éxito en validación
+// NotifyValidationSuccess sends a notification for successful validation of a resource.
+// This is typically used to confirm that a resource has passed all policy checks.
 func (r *ClusterPolicyValidatorReconciler) NotifyValidationSuccess(ctx context.Context, message string) error {
 	successMessage := fmt.Sprintf("✅ %s", message)
-	return r.SendCustomNotification(ctx, "slack-notifier", successMessage)
+	return r.SendCustomNotification(ctx, defaultNotifier, successMessage)
 }
 
-// ✅ Método para notificar warning
+// NotifyWarning sends a warning notification.
+// This is used for non-blocking issues that should be brought to attention.
 func (r *ClusterPolicyValidatorReconciler) NotifyWarning(ctx context.Context, message string) error {
 	warningMessage := fmt.Sprintf("⚠️ %s", message)
-	return r.SendCustomNotification(ctx, "slack-notifier", warningMessage)
+	return r.SendCustomNotification(ctx, defaultNotifier, warningMessage)
 }

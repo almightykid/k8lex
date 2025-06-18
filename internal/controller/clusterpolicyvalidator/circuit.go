@@ -21,6 +21,36 @@ func NewCircuitBreaker(threshold int, timeout time.Duration) *CircuitBreaker {
 	}
 }
 
+// CircuitBreakerError represents a circuit breaker specific error
+type CircuitBreakerError struct {
+	State     CircuitBreakerState
+	Failures  int
+	LastError error
+}
+
+func (e *CircuitBreakerError) Error() string {
+	return fmt.Sprintf("circuit breaker is %s (failures: %d, last error: %v)",
+		circuitBreakerStateToString(e.State), e.Failures, e.LastError)
+}
+
+func (e *CircuitBreakerError) Unwrap() error {
+	return e.LastError
+}
+
+// circuitBreakerStateToString converts CircuitBreakerState to string
+func circuitBreakerStateToString(state CircuitBreakerState) string {
+	switch state {
+	case CircuitClosed:
+		return "closed"
+	case CircuitOpen:
+		return "open"
+	case CircuitHalfOpen:
+		return "half-open"
+	default:
+		return "unknown"
+	}
+}
+
 // Call executes the provided function through the circuit breaker protection mechanism
 // The circuit breaker tracks failures and can reject calls when the failure threshold is exceeded
 // This prevents overwhelming a failing service and allows for graceful degradation
@@ -32,6 +62,9 @@ func (cb *CircuitBreaker) Call(fn func() error) error {
 	lastFailTime := cb.lastFailTime
 	cb.mu.RUnlock()
 
+	// Record metrics for circuit breaker state
+	circuitBreakerState.WithLabelValues(circuitBreakerStateToString(state)).Set(1)
+
 	// Attempt transition from Open to HalfOpen state after timeout period
 	// This allows testing if the service has recovered from its failure condition
 	if state == CircuitOpen && time.Since(lastFailTime) > cb.timeout {
@@ -39,6 +72,8 @@ func (cb *CircuitBreaker) Call(fn func() error) error {
 		// Double-check condition while holding write lock to prevent race conditions
 		if cb.state == CircuitOpen && time.Since(cb.lastFailTime) > cb.timeout {
 			cb.state = CircuitHalfOpen
+			circuitBreakerState.WithLabelValues("half-open").Set(1)
+			circuitBreakerState.WithLabelValues("open").Set(0)
 		}
 		cb.mu.Unlock()
 	}
@@ -46,7 +81,11 @@ func (cb *CircuitBreaker) Call(fn func() error) error {
 	// Reject the call immediately if circuit is open (fast-fail behavior)
 	// This protects the failing service from additional load and provides immediate feedback
 	if state == CircuitOpen {
-		return fmt.Errorf("circuit breaker is open (failures: %d)", failures)
+		return &CircuitBreakerError{
+			State:     CircuitOpen,
+			Failures:  failures,
+			LastError: fmt.Errorf("circuit breaker is open"),
+		}
 	}
 
 	// Execute the protected operation
@@ -64,14 +103,22 @@ func (cb *CircuitBreaker) Call(fn func() error) error {
 		// Open circuit if failure threshold is reached
 		if cb.failures >= cb.threshold {
 			cb.state = CircuitOpen
+			circuitBreakerState.WithLabelValues("open").Set(1)
+			circuitBreakerState.WithLabelValues("closed").Set(0)
 		}
 
-		return err
+		return &CircuitBreakerError{
+			State:     cb.state,
+			Failures:  cb.failures,
+			LastError: err,
+		}
 	}
 
 	// Operation succeeded - reset circuit breaker to healthy state
 	if cb.state == CircuitHalfOpen {
 		cb.state = CircuitClosed // Transition from testing back to normal operation
+		circuitBreakerState.WithLabelValues("closed").Set(1)
+		circuitBreakerState.WithLabelValues("half-open").Set(0)
 	}
 	cb.failures = 0 // Reset failure counter on successful operation
 

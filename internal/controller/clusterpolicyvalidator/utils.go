@@ -78,7 +78,7 @@ func (r *ClusterPolicyValidatorReconciler) findResource(ctx context.Context, req
 		"searched_gvks", len(r.DynamicGVKs))
 
 	// Increment metrics counter for resources not found or not watched
-	errorTotal.WithLabelValues("resource_not_found_or_not_watched", "unknown").Inc()
+	errorTotal.WithLabelValues("resource_not_found_or_not_watched", "unknown", "low").Inc()
 
 	// Return nil if not found in any GVK (this is expected for resources we don't watch)
 	return nil, schema.GroupVersionKind{}, nil

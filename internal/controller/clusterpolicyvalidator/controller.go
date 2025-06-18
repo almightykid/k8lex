@@ -165,7 +165,9 @@ func (r *ClusterPolicyValidatorReconciler) SetupWithManager(mgr ctrl.Manager) er
 // This method handles both policy configuration changes and resource validation requests with enterprise-grade
 // reliability patterns including circuit breakers, exponential backoff, and comprehensive observability
 func (r *ClusterPolicyValidatorReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	logger := r.Log
+	logger := r.Log.WithValues(
+		"request_namespace", req.Namespace,
+		"request_name", req.Name)
 
 	// Ensure all enhanced features are initialized before processing any requests
 	r.initializeIfNeeded()
@@ -179,7 +181,7 @@ func (r *ClusterPolicyValidatorReconciler) Reconcile(ctx context.Context, req ct
 		duration := time.Since(start)
 		reconcileDuration.WithLabelValues("clusterpolicyvalidator", reconcileResultLabel).Observe(duration.Seconds())
 		logger.V(2).Info("Reconciliation completed",
-			"duration", duration,
+			"duration_ms", duration.Milliseconds(),
 			"result", reconcileResultLabel)
 	}()
 
@@ -188,14 +190,14 @@ func (r *ClusterPolicyValidatorReconciler) Reconcile(ctx context.Context, req ct
 	quickErr := r.Get(ctx, req.NamespacedName, policy)
 
 	if quickErr == nil {
-		logger.Info("👀 ClusterPolicyValidator policy configuration registered",
+		logger.Info("Processing ClusterPolicyValidator configuration",
 			"policy_name", policy.Name,
 			"generation", policy.Generation)
 
 		// Invalidate policy cache to ensure fresh policy data for subsequent evaluations
 		if r.policyCache != nil {
 			r.policyCache = NewLRUCache(100)
-			logger.V(2).Info("Policy cache invalidated due to policy configuration change")
+			logger.V(2).Info("Policy cache invalidated due to configuration change")
 		}
 
 		// Update namespace filtering rules with retry protection for API calls
@@ -205,18 +207,20 @@ func (r *ClusterPolicyValidatorReconciler) Reconcile(ctx context.Context, req ct
 
 		if updateErr != nil {
 			reconcileResultLabel = "error"
-			logger.Error(updateErr, "Failed to update namespace filter state after policy change")
+			logger.Error(updateErr, "Failed to update namespace filter state",
+				"policy_name", policy.Name,
+				"error_type", fmt.Sprintf("%T", updateErr))
 			return ctrl.Result{RequeueAfter: r.calculateBackoffDelay(1)}, updateErr
 		}
 
-		logger.Info("👍🏼 Policy configuration change processed successfully",
-			"policy_name", policy.Name)
+		logger.Info("Policy configuration processed successfully",
+			"policy_name", policy.Name,
+			"status", "completed")
 		return ctrl.Result{}, nil
 
 	} else if apierrors.IsNotFound(quickErr) {
 		// EXPECTED: This is NOT a ClusterPolicyValidator - it's a resource validation request
 		logger.V(1).Info("Processing resource validation request",
-			"namespacedName", req.NamespacedName,
 			"action", "validating_resource_against_policies")
 
 		// Execute resource validation with existing retry protection
@@ -227,13 +231,13 @@ func (r *ClusterPolicyValidatorReconciler) Reconcile(ctx context.Context, req ct
 			delay := r.calculateBackoffDelay(1)
 			if apierrors.IsServiceUnavailable(err) || apierrors.IsTimeout(err) {
 				delay = r.calculateBackoffDelay(2)
-				logger.Info("Server-side error detected - using extended backoff delay",
+				logger.Info("Server-side error detected - using extended backoff",
 					"error_type", fmt.Sprintf("%T", err),
-					"delay", delay)
+					"delay_ms", delay.Milliseconds())
 			}
 
-			logger.Error(err, "Resource validation failed - will retry with backoff",
-				"delay", delay,
+			logger.Error(err, "Resource validation failed - will retry",
+				"delay_ms", delay.Milliseconds(),
 				"error_type", fmt.Sprintf("%T", err))
 			return ctrl.Result{RequeueAfter: delay}, err
 		}
@@ -251,7 +255,7 @@ func (r *ClusterPolicyValidatorReconciler) Reconcile(ctx context.Context, req ct
 
 		if retryErr == nil {
 			// Retry succeeded - process as policy
-			logger.Info("👀 ClusterPolicyValidator found after connectivity retry",
+			logger.Info("ClusterPolicyValidator found after connectivity retry",
 				"policy_name", policy.Name,
 				"generation", policy.Generation)
 
@@ -266,15 +270,20 @@ func (r *ClusterPolicyValidatorReconciler) Reconcile(ctx context.Context, req ct
 
 			if updateErr != nil {
 				reconcileResultLabel = "error"
+				logger.Error(updateErr, "Failed to update namespace filter state after retry",
+					"policy_name", policy.Name,
+					"error_type", fmt.Sprintf("%T", updateErr))
 				return ctrl.Result{RequeueAfter: r.calculateBackoffDelay(1)}, updateErr
 			}
 
-			logger.Info("👍🏼 Policy configuration change processed successfully after retry",
-				"policy_name", policy.Name)
+			logger.Info("Policy configuration processed successfully after retry",
+				"policy_name", policy.Name,
+				"status", "completed")
 			return ctrl.Result{}, nil
 		} else {
 			reconcileResultLabel = "error"
-			logger.Error(retryErr, "Failed to determine resource type after connectivity retry")
+			logger.Error(retryErr, "Failed to determine resource type after connectivity retry",
+				"error_type", fmt.Sprintf("%T", retryErr))
 			return ctrl.Result{RequeueAfter: r.calculateBackoffDelay(1)}, retryErr
 		}
 	}

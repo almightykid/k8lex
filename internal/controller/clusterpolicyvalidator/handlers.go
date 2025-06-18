@@ -35,7 +35,7 @@ func (r *ClusterPolicyValidatorReconciler) handleViolations(
 	// Iterate over each detected violation.
 	for _, violation := range violations {
 		// Record Prometheus metrics for policy violations and actions taken.
-		policyViolations.WithLabelValues(violation.PolicyName, resourceGVK.Kind, violation.Severity).Inc()
+		policyViolations.WithLabelValues(violation.PolicyName, resourceGVK.Kind, violation.Severity, violation.Action).Inc()
 		actionTakenTotal.WithLabelValues(violation.Action, resourceGVK.Kind, violation.Severity).Inc()
 
 		// Execute the action defined by the policy (e.g., "block", "warn", "audit").
