@@ -111,6 +111,59 @@ func (r *ClusterPolicyValidatorReconciler) Reconcile(ctx context.Context, req ct
 		logger.Info("Processing ClusterPolicyValidator configuration",
 			"policy_name", policy.Name,
 			"generation", policy.Generation)
+
+		// --- BEGIN OVERLAP VALIDATION ---
+		policyList := &clusterpolicyvalidatorv1alpha1.ClusterPolicyValidatorList{}
+		errList := r.List(ctx, policyList)
+		if errList != nil {
+			logger.Error(errList, "Failed to list ClusterPolicyValidators for overlap validation")
+			return ctrl.Result{}, errList
+		}
+		var overlapErrors []string
+		for _, rule := range policy.Spec.ValidationRules {
+			for _, cond := range rule.Conditions {
+				for _, other := range policyList.Items {
+					if other.Name == policy.Name {
+						continue // skip self
+					}
+					for _, otherRule := range other.Spec.ValidationRules {
+						for _, otherCond := range otherRule.Conditions {
+							// Check for same Kind and Condition.Key
+							for _, kind := range rule.MatchResources.Kinds {
+								for _, otherKind := range otherRule.MatchResources.Kinds {
+									if kind == otherKind && cond.Key == otherCond.Key {
+										errMsg := "Overlap detected: Rule '" + rule.Name + "' (" + policy.Name + ") and Rule '" + otherRule.Name + "' (" + other.Name + ") both match Kind '" + kind + "' and path '" + cond.Key + "'"
+										logger.Info(errMsg)
+										overlapErrors = append(overlapErrors, errMsg)
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+		if len(overlapErrors) > 0 {
+			// Update status with error
+			policy.Status.ValidationStatus = "Invalid"
+			policy.Status.ValidationErrors = overlapErrors
+			errStatus := r.Status().Update(ctx, policy)
+			if errStatus != nil {
+				logger.Error(errStatus, "Failed to update status with overlap errors")
+			}
+			return ctrl.Result{}, nil
+		} else {
+			// Clear previous errors if any
+			if policy.Status.ValidationStatus == "Invalid" || len(policy.Status.ValidationErrors) > 0 {
+				policy.Status.ValidationStatus = "Valid"
+				policy.Status.ValidationErrors = nil
+				errStatus := r.Status().Update(ctx, policy)
+				if errStatus != nil {
+					logger.Error(errStatus, "Failed to clear previous overlap errors")
+				}
+			}
+		}
+		// --- END OVERLAP VALIDATION ---
 		return ctrl.Result{}, nil
 	} else if apierrors.IsNotFound(err) {
 		logger.Info("Processing resource validation request",
@@ -160,13 +213,31 @@ func (r *ClusterPolicyValidatorReconciler) validateResource(ctx context.Context,
 	}
 	policies := policyList.Items
 
+	// Si el recurso está anotado para updater pero ya no incumple la regla, limpiar anotaciones y terminar
+	annotations := resource.GetAnnotations()
+	if annotations != nil && annotations["k8lex.io/clusterpolicyupdater"] != "" {
+		// Revalidar el recurso
+		violations := r.evaluatePolicies(ctx, resource, foundResource, resourceGVK, policies, logger)
+		if len(violations) == 0 {
+			logger.Info("Resource previously blocked, but now passes validation after updater. Clearing annotations.", "resource", resource.GetName())
+			delete(annotations, "k8lex.io/clusterpolicyupdater")
+			resource.SetAnnotations(annotations)
+			if err := r.Update(ctx, resource); err != nil {
+				logger.Error(err, "Failed to clear updater annotation after successful update", "resource", resource.GetName())
+			}
+			return ctrl.Result{}, nil
+		}
+		return ctrl.Result{}, nil
+	}
+
 	violations := r.evaluatePolicies(ctx, resource, foundResource, resourceGVK, policies, logger)
 	if len(violations) > 0 {
 		logger.Info("Policy violations detected - initiating enforcement actions",
 			"violation_count", len(violations),
 			"resource", foundResource.GetName(),
 			"kind", resourceGVK.Kind)
-		return r.handleViolations(ctx, foundResource, resource, resourceGVK, violations, policies, logger)
+		result, err := r.handleViolations(ctx, foundResource, resource, resourceGVK, violations, policies, logger)
+		return result, err
 	}
 
 	r.clearViolationAnnotations(ctx, resource, logger)

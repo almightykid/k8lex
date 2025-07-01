@@ -126,6 +126,7 @@ func (r *ClusterPolicyValidatorReconciler) validateCondition(
 	actualValues []interface{}, // The values extracted from the resource.
 	logger logr.Logger, // Logger for detailed debugging.
 ) bool {
+	logger.Info("[DEBUG] Validating condition", "operator", condition.Operator, "expectedValues", condition.Values, "actualValues", actualValues)
 	// Handle special cases for empty or non-existent values.
 	if len(actualValues) == 0 {
 		logger.V(2).Info("No values extracted for condition. Checking for IsEmpty/IsNotEmpty operator.",
@@ -138,8 +139,6 @@ func (r *ClusterPolicyValidatorReconciler) validateCondition(
 	// Handle "IsEmpty" and "IsNotEmpty" operators first as they don't depend on actual values.
 	switch condition.Operator {
 	case "IsEmpty":
-		// This case is already covered by the len(actualValues) == 0 check above,
-		// but kept for explicit clarity.
 		return len(actualValues) == 0
 	case "IsNotEmpty":
 		return len(actualValues) > 0
@@ -149,11 +148,13 @@ func (r *ClusterPolicyValidatorReconciler) validateCondition(
 	// and check if it satisfies the condition against *any* of the expected values.
 	for _, actualVal := range actualValues {
 		actualStr := fmt.Sprintf("%v", actualVal) // Convert the actual value to string for comparison.
+		logger.Info("[DEBUG] Comparing actual value to expected values", "actualValue", actualStr, "operator", condition.Operator, "expectedValues", condition.Values)
 
 		if len(condition.Values) > 0 {
 			// If expected values are provided, check if any of them match.
 			matchFound := false
 			for _, expectedVal := range condition.Values {
+				logger.Info("[DEBUG] Evaluating single condition", "actualValue", actualStr, "operator", condition.Operator, "expectedValue", expectedVal)
 				if r.evaluateSingleCondition(actualStr, condition.Operator, expectedVal, logger) {
 					matchFound = true
 					break // Found a match for this actual value, no need to check other expected values.
