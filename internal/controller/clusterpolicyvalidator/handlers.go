@@ -112,7 +112,7 @@ func (r *ClusterPolicyValidatorReconciler) handleResourceAction(
 	case "warn":
 		logger.Info("Action is 'warn': no updater, send notification if enabled")
 		if notificationEnabled && isNotifierEnabledAndExists(ctx, r.Client, notifierRef, logger) {
-			if err := r.SendPolicyViolationNotification(ctx, resource.GetName(), violation.RuleName, customMessage); err != nil {
+			if err := r.SendPolicyViolationNotification(ctx, resource.GetName(), violation.RuleName, customMessage, "warn"); err != nil {
 				logger.Error(err, "Failed to send policy violation notification (warn)", "resource", resource.GetName(), "policy", violation.PolicyName, "rule", violation.RuleName)
 			} else {
 				logger.Info("Policy violation notification sent successfully (warn)", "resource", resource.GetName(), "policy", violation.PolicyName)
@@ -323,7 +323,7 @@ func (r *ClusterPolicyValidatorReconciler) handleControllerBlocking(
 	// Obtener el nombre del updater de la regla
 	updaterName, _ := getUpdaterNameAndKey(policies, violation.PolicyName, violation.RuleName)
 	if updaterName == "" {
-		logger.Error(nil, "No updater name specified in rule; skipping updater annotation",
+		logger.V(1).Info("No updater name specified in rule; skipping updater annotation (warn)",
 			"resource", resource.GetName(), "policy", violation.PolicyName, "rule", violation.RuleName)
 	} else {
 		annotations["k8lex.io/clusterpolicyupdater"] = updaterName
@@ -334,21 +334,18 @@ func (r *ClusterPolicyValidatorReconciler) handleControllerBlocking(
 	unstructuredObj.SetAnnotations(annotations)
 
 	// Update the resource in Kubernetes API.
-	if err := r.Update(ctx, unstructuredObj); err != nil {
-		if apierrors.IsConflict(err) {
-			logger.Info("Resource update conflict - controller will retry automatically",
-				"kind", unstructuredObj.GetKind(),
-				"resource", resource.GetName(),
-				"namespace", resource.GetNamespace(),
-				"behavior", "automatic_retry_by_controller_runtime")
-			return err // Return the conflict error to trigger requeue
-		} else {
-			logger.Error(err, "Failed to update resource (non-conflict error)",
-				"kind", unstructuredObj.GetKind(),
-				"resource", resource.GetName(),
-				"namespace", resource.GetNamespace())
+	maxRetries := 5
+	for i := 0; i < maxRetries; i++ {
+		if err := r.Update(ctx, unstructuredObj); err != nil {
+			if apierrors.IsConflict(err) {
+				logger.Info("Resource update conflict, retrying", "attempt", i+1, "kind", unstructuredObj.GetKind(), "resource", unstructuredObj.GetName(), "namespace", unstructuredObj.GetNamespace())
+				_ = r.Get(ctx, client.ObjectKey{Namespace: unstructuredObj.GetNamespace(), Name: unstructuredObj.GetName()}, unstructuredObj)
+				continue
+			}
+			logger.Error(err, "Failed to update resource (non-conflict error)", "kind", unstructuredObj.GetKind(), "resource", unstructuredObj.GetName(), "namespace", unstructuredObj.GetNamespace())
 			return err
 		}
+		break
 	}
 
 	// Record a Kubernetes event to signal the resource has been scaled down due to policy violation.
@@ -358,7 +355,6 @@ func (r *ClusterPolicyValidatorReconciler) handleControllerBlocking(
 
 	// Send notification to Slack if enabled and resource was actually scaled down (not already blocked)
 	wasAlreadyBlocked := annotations[PolicyBlockedAnnotation] == "true" && annotations["k8lex.io/clusterpolicyupdater"] != ""
-
 	if !wasAlreadyBlocked {
 		var notificationEnabled bool
 		var notifierRef clusterpolicyvalidatorv1alpha1.Ref
@@ -383,7 +379,7 @@ func (r *ClusterPolicyValidatorReconciler) handleControllerBlocking(
 
 		// Send notification if enabled and notifier exists
 		if notificationEnabled && isNotifierEnabledAndExists(ctx, r.Client, notifierRef, logger) {
-			if err := r.SendPolicyViolationNotification(ctx, unstructuredObj.GetName(), violation.RuleName, customMessage); err != nil {
+			if err := r.SendPolicyViolationNotification(ctx, unstructuredObj.GetName(), violation.RuleName, customMessage, "block"); err != nil {
 				logger.Error(err, "Failed to send policy violation notification",
 					"resource", unstructuredObj.GetName(),
 					"policy", violation.PolicyName,

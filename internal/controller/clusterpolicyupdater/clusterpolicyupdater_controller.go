@@ -136,6 +136,28 @@ func (r *ClusterPolicyUpdaterReconciler) Reconcile(ctx context.Context, req ctrl
 					log.Info("Field to update not found, skipping", "key", update.Key, "resource", item.GetName())
 					continue
 				}
+				// Special handling for map fields (e.g., labels) and string values in 'key: value' format
+				if m, ok := current.(map[string]interface{}); ok {
+					value := fmt.Sprintf("%v", update.Value)
+					if strings.Contains(value, ":") {
+						pairs := strings.Split(value, ",")
+						for _, pair := range pairs {
+							kv := strings.SplitN(strings.TrimSpace(pair), ":", 2)
+							if len(kv) == 2 {
+								key := strings.TrimSpace(kv[0])
+								val := strings.TrimSpace(kv[1])
+								m[key] = val
+							}
+						}
+						if err := unstructured.SetNestedField(item.Object, m, keyPath...); err != nil {
+							log.Error(err, "Failed to set map field after merging", "key", update.Key, "value", update.Value)
+							continue
+						}
+						updated = true
+						log.Info("Map field updated (merged)", "key", update.Key, "value", update.Value, "resource", item.GetName())
+						continue
+					}
+				}
 				if current == update.Value {
 					log.Info("Field already has desired value, skipping update", "key", update.Key, "resource", item.GetName())
 					continue

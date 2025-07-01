@@ -14,7 +14,7 @@ const (
 
 // SendPolicyViolationNotification sends a notification when a resource violates a policy rule.
 // It includes details about the resource, the violated rule, and the reason for the violation.
-func (r *ClusterPolicyValidatorReconciler) SendPolicyViolationNotification(ctx context.Context, resourceName, ruleName, reason string) error {
+func (r *ClusterPolicyValidatorReconciler) SendPolicyViolationNotification(ctx context.Context, resourceName, ruleName, reason, action string) error {
 	logger := log.FromContext(ctx)
 
 	if r.NotifierController == nil {
@@ -22,8 +22,18 @@ func (r *ClusterPolicyValidatorReconciler) SendPolicyViolationNotification(ctx c
 		return nil
 	}
 
-	message := fmt.Sprintf("Blocking resource %s due to violation of rule %s\n\nReason: %s",
-		resourceName, ruleName, reason)
+	var message string
+	switch action {
+	case "warn":
+		message = fmt.Sprintf("⚠️ Policy violation detected for resource %s (Rule: %s): %s",
+			resourceName, ruleName, reason)
+	case "block":
+		message = fmt.Sprintf("⛔ Blocking resource %s due to violation of rule %s\n\nReason: %s",
+			resourceName, ruleName, reason)
+	default:
+		message = fmt.Sprintf("Policy violation detected for resource %s (Rule: %s): %s",
+			resourceName, ruleName, reason)
+	}
 
 	logger.Info("Sending policy violation notification",
 		"resource", resourceName,

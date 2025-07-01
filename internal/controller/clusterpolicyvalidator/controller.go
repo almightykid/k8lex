@@ -222,8 +222,18 @@ func (r *ClusterPolicyValidatorReconciler) validateResource(ctx context.Context,
 			logger.Info("Resource previously blocked, but now passes validation after updater. Clearing annotations.", "resource", resource.GetName())
 			delete(annotations, "k8lex.io/clusterpolicyupdater")
 			resource.SetAnnotations(annotations)
-			if err := r.Update(ctx, resource); err != nil {
-				logger.Error(err, "Failed to clear updater annotation after successful update", "resource", resource.GetName())
+			maxRetries := 5
+			for i := 0; i < maxRetries; i++ {
+				if err := r.Update(ctx, resource); err != nil {
+					if apierrors.IsConflict(err) {
+						logger.Info("Conflict clearing updater annotation, retrying", "attempt", i+1, "resource", resource.GetName())
+						_ = r.Get(ctx, client.ObjectKey{Namespace: resource.GetNamespace(), Name: resource.GetName()}, resource)
+						continue
+					}
+					logger.Error(err, "Failed to clear updater annotation after successful update", "resource", resource.GetName())
+					break
+				}
+				break
 			}
 			return ctrl.Result{}, nil
 		}

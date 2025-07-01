@@ -94,7 +94,7 @@ func (r *ClusterPolicyValidatorReconciler) evaluateRule(
 
 		// Validate the extracted values against the condition's operator and expected values.
 		// If the validation fails, a violation is detected.
-		if r.validateCondition(condition, values, logger) {
+		if !r.validateCondition(condition, values, logger) {
 			logger.Info("Rule violation detected",
 				"policy", policyName,
 				"rule", rule.Name,
@@ -127,6 +127,36 @@ func (r *ClusterPolicyValidatorReconciler) validateCondition(
 	logger logr.Logger, // Logger for detailed debugging.
 ) bool {
 	logger.Info("[DEBUG] Validating condition", "operator", condition.Operator, "expectedValues", condition.Values, "actualValues", actualValues)
+
+	// Normalize actualValues: treat nil as ""
+	normalized := make([]string, 0, len(actualValues))
+	for _, v := range actualValues {
+		if v == nil {
+			normalized = append(normalized, "")
+		} else {
+			normalized = append(normalized, fmt.Sprintf("%v", v))
+		}
+	}
+
+	if condition.Operator == "IsEmpty" {
+		allEmpty := true
+		for _, v := range normalized {
+			if v != "" {
+				allEmpty = false
+				break
+			}
+		}
+		return !allEmpty
+	}
+	if condition.Operator == "IsNotEmpty" {
+		for _, v := range normalized {
+			if v != "" {
+				return true
+			}
+		}
+		return false
+	}
+
 	// Handle special cases for empty or non-existent values.
 	if len(actualValues) == 0 {
 		logger.V(2).Info("No values extracted for condition. Checking for IsEmpty/IsNotEmpty operator.",
@@ -136,17 +166,47 @@ func (r *ClusterPolicyValidatorReconciler) validateCondition(
 		return condition.Operator == "IsEmpty"
 	}
 
-	// Handle "IsEmpty" and "IsNotEmpty" operators first as they don't depend on actual values.
-	switch condition.Operator {
-	case "IsEmpty":
-		return len(actualValues) == 0
-	case "IsNotEmpty":
-		return len(actualValues) > 0
-	}
-
 	// For other operators, iterate through each extracted actual value
 	// and check if it satisfies the condition against *any* of the expected values.
 	for _, actualVal := range actualValues {
+		// Special handling for map values (e.g., labels)
+		if m, ok := actualVal.(map[string]interface{}); ok {
+			matched := false
+			for _, expectedVal := range condition.Values {
+				if condition.Operator == "Contains" {
+					if _, exists := m[expectedVal]; exists {
+						logger.Info("[DEBUG] Map contains key", "mapKeys", m, "expectedKey", expectedVal)
+						matched = true
+						break
+					}
+				}
+				if condition.Operator == "NotContains" {
+					if _, exists := m[expectedVal]; !exists {
+						logger.Info("[DEBUG] Map does not contain key", "mapKeys", m, "expectedKey", expectedVal)
+						matched = true
+						break
+					}
+				}
+				if condition.Operator == "Equals" {
+					if v, exists := m[expectedVal]; exists && v == expectedVal {
+						logger.Info("[DEBUG] Map key equals expected value", "mapKeys", m, "expectedKey", expectedVal)
+						matched = true
+						break
+					}
+				}
+				if condition.Operator == "NotEquals" {
+					if v, exists := m[expectedVal]; !exists || v != expectedVal {
+						logger.Info("[DEBUG] Map key not equals expected value", "mapKeys", m, "expectedKey", expectedVal)
+						matched = true
+						break
+					}
+				}
+			}
+			if matched {
+				return true
+			}
+			continue // skip normal string logic for maps
+		}
 		actualStr := fmt.Sprintf("%v", actualVal) // Convert the actual value to string for comparison.
 		logger.Info("[DEBUG] Comparing actual value to expected values", "actualValue", actualStr, "operator", condition.Operator, "expectedValues", condition.Values)
 
@@ -175,9 +235,8 @@ func (r *ClusterPolicyValidatorReconciler) validateCondition(
 		}
 	}
 
-	// If all actual values (or at least one for "OR" type conditions implicitly handled by for-loop)
-	// passed the evaluation against the expected values, the condition is met.
-	return true
+	// If none of the actual values satisfied the condition, return false (violation)
+	return false
 }
 
 // evaluateSingleCondition performs the actual comparison for a single actual value,

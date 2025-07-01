@@ -9,6 +9,7 @@ import (
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -122,54 +123,39 @@ func (r *ClusterPolicyValidatorReconciler) updateViolationAnnotations(
 	violations []ValidationResult,
 	logger logr.Logger,
 ) error {
-	// Get existing annotations or create new map if none exist
-	annotations := resource.GetAnnotations()
-	if annotations == nil {
-		annotations = make(map[string]string)
-	}
-
-	// Copia de las anotaciones originales para comparar
-	original := make(map[string]string, len(annotations))
-	for k, v := range annotations {
-		original[k] = v
-	}
-
-	if len(violations) > 0 {
-		annotations[PolicyViolationAnnotation] = "true"
-		var details []string
-		for _, v := range violations {
-			detail := fmt.Sprintf("Policy: %s, Rule: %s, Message: %s",
-				v.PolicyName, v.RuleName, v.ErrorMessage)
-			details = append(details, detail)
+	maxRetries := 5
+	for i := 0; i < maxRetries; i++ {
+		annotations := resource.GetAnnotations()
+		if annotations == nil {
+			annotations = map[string]string{}
 		}
-		annotations[ViolationDetailsAnnotation] = strings.Join(details, "; ")
-	} else {
-		delete(annotations, PolicyViolationAnnotation)
-		delete(annotations, ViolationDetailsAnnotation)
-	}
-
-	// Solo actualiza si hay cambios reales
-	changed := false
-	if len(annotations) != len(original) {
-		changed = true
-	} else {
-		for k, v := range annotations {
-			if original[k] != v {
-				changed = true
-				break
-			}
+		if len(violations) > 0 {
+			annotations[PolicyViolationAnnotation] = "true"
+			// Optionally, store details of the violation
+			annotations[ViolationDetailsAnnotation] = fmt.Sprintf("%v", violations)
+		} else {
+			delete(annotations, PolicyViolationAnnotation)
+			delete(annotations, ViolationDetailsAnnotation)
+			delete(annotations, "k8lex.io/clusterpolicyupdater")
 		}
-	}
-	if changed {
 		resource.SetAnnotations(annotations)
 		if err := r.Update(ctx, resource); err != nil {
-			logger.Error(err, "Failed to update resource annotations",
-				"name", resource.GetName(),
-				"namespace", resource.GetNamespace())
+			if apierrors.IsConflict(err) {
+				logger.Info("Conflict updating resource annotations, retrying", "attempt", i+1, "name", resource.GetName(), "namespace", resource.GetNamespace())
+				// Reload the latest version and retry
+				if errGet := r.Get(ctx, client.ObjectKey{Namespace: resource.GetNamespace(), Name: resource.GetName()}, resource); errGet != nil {
+					logger.Error(errGet, "Failed to reload resource after conflict", "name", resource.GetName(), "namespace", resource.GetNamespace())
+					return errGet
+				}
+				continue
+			}
+			logger.Error(err, "Failed to update resource annotations", "name", resource.GetName(), "namespace", resource.GetNamespace())
 			return err
 		}
+		logger.V(1).Info("Updated resource annotations", "name", resource.GetName(), "namespace", resource.GetNamespace())
+		return nil
 	}
-	return nil
+	return fmt.Errorf("Failed to update resource annotations after %d retries due to conflicts", maxRetries)
 }
 
 // clearViolationAnnotations removes policy violation annotations from a Kubernetes
