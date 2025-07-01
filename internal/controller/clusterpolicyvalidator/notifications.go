@@ -22,7 +22,7 @@ func (r *ClusterPolicyValidatorReconciler) SendPolicyViolationNotification(ctx c
 		return nil
 	}
 
-	message := fmt.Sprintf("🚨 Blocking resource %s due to violation of rule %s\n\nReason: %s",
+	message := fmt.Sprintf("Blocking resource %s due to violation of rule %s\n\nReason: %s",
 		resourceName, ruleName, reason)
 
 	logger.Info("Sending policy violation notification",
@@ -63,7 +63,7 @@ func (r *ClusterPolicyValidatorReconciler) SendCustomNotification(ctx context.Co
 // name, the violated rule, and the reason for blocking.
 func (r *ClusterPolicyValidatorReconciler) NotifyResourceBlocked(ctx context.Context, resourceName, resourceKind, ruleName, reason string) error {
 	fullResourceName := fmt.Sprintf("%s/%s", resourceKind, resourceName)
-	message := fmt.Sprintf("🚫 Blocking resource %s due to violation of rule %s\n\n📋 Reason: %s\n🕐 Timestamp: %s",
+	message := fmt.Sprintf("Blocking resource %s due to violation of rule %s\n\n📋 Reason: %s\n🕐 Timestamp: %s",
 		fullResourceName, ruleName, reason, time.Now().Format(time.RFC3339))
 
 	return r.SendCustomNotification(ctx, defaultNotifier, message)

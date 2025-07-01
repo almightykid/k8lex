@@ -6,9 +6,9 @@ import (
 	"reflect"
 	"strings"
 
-	clusterpolicyvalidatorv1alpha1 "github.com/almightykid/k8lex/api/clusterpolicyvalidator/v1alpha1"
 	"github.com/go-logr/logr"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -20,67 +20,26 @@ import (
 // configured in the reconciler. It iterates through the WatchedResources configuration
 // and tries to retrieve the resource specified in the reconcile request.
 func (r *ClusterPolicyValidatorReconciler) findResource(ctx context.Context, req ctrl.Request, logger logr.Logger) (client.Object, schema.GroupVersionKind, error) {
-	logger.V(2).Info("Searching for resource in dynamic GVKs",
-		"namespacedName", req.NamespacedName,
-		"dynamic_gvks_count", len(r.DynamicGVKs))
+	resourceTypes := []struct {
+		obj client.Object
+		gvk schema.GroupVersionKind
+	}{
+		{&appsv1.Deployment{}, schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"}},
+		{&appsv1.StatefulSet{}, schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "StatefulSet"}},
+		{&appsv1.ReplicaSet{}, schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "ReplicaSet"}},
+		{&appsv1.DaemonSet{}, schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "DaemonSet"}},
+		{&batchv1.Job{}, schema.GroupVersionKind{Group: "batch", Version: "v1", Kind: "Job"}},
+		{&batchv1.CronJob{}, schema.GroupVersionKind{Group: "batch", Version: "v1", Kind: "CronJob"}},
+	}
 
-	// Iterate through all configured watched resource types
-	for gvk := range r.DynamicGVKs {
-		// Skip ClusterPolicyValidator resources to avoid self-validation loops
-		if gvk.Kind == "ClusterPolicyValidator" &&
-			gvk.Group == clusterpolicyvalidatorv1alpha1.GroupVersion.Group {
-			logger.V(3).Info("Skipping ClusterPolicyValidator GVK to avoid self-validation", "gvk", gvk)
-			continue
-		}
-
-		logger.V(3).Info("Trying to find resource as GVK",
-			"gvk", gvk,
-			"namespacedName", req.NamespacedName)
-
-		// Create object for this GVK using the scheme
-		obj, err := r.Scheme.New(gvk)
-		if err != nil {
-			logger.V(3).Info("Failed to create object for GVK", "gvk", gvk, "error", err)
-			continue
-		}
-
-		// Ensure the object implements client.Object
-		clientObj, ok := obj.(client.Object)
-		if !ok {
-			logger.V(3).Info("Object does not implement client.Object", "gvk", gvk)
-			continue
-		}
-
-		// Set the GVK on the object (important for some operations)
-		clientObj.GetObjectKind().SetGroupVersionKind(gvk)
-
-		// Attempt to retrieve the resource from the cluster
-		if err := r.Get(ctx, req.NamespacedName, clientObj); err == nil {
-			logger.V(2).Info("Found matching resource",
-				"kind", gvk.Kind,
-				"name", clientObj.GetName(),
-				"namespace", clientObj.GetNamespace(),
-				"gvk", gvk)
-			return clientObj, gvk, nil
-		} else if !apierrors.IsNotFound(err) {
-			// Real error (not just NotFound) - log and potentially return error
-			logger.V(3).Info("Error getting resource as GVK", "gvk", gvk, "error", err)
-			// For connectivity issues, we might want to return the error
-			// But for now, we'll continue trying other GVKs
-			continue
-		} else {
-			logger.V(3).Info("Resource not found as GVK", "gvk", gvk)
+	for _, rt := range resourceTypes {
+		obj := rt.obj.DeepCopyObject().(client.Object)
+		err := r.Get(ctx, req.NamespacedName, obj)
+		if err == nil {
+			return obj, rt.gvk, nil
 		}
 	}
 
-	logger.V(2).Info("Resource not found in any dynamic GVKs",
-		"namespacedName", req.NamespacedName,
-		"searched_gvks", len(r.DynamicGVKs))
-
-	// Increment metrics counter for resources not found or not watched
-	errorTotal.WithLabelValues("resource_not_found_or_not_watched", "unknown", "low").Inc()
-
-	// Return nil if not found in any GVK (this is expected for resources we don't watch)
 	return nil, schema.GroupVersionKind{}, nil
 }
 
@@ -169,37 +128,47 @@ func (r *ClusterPolicyValidatorReconciler) updateViolationAnnotations(
 		annotations = make(map[string]string)
 	}
 
-	if len(violations) > 0 {
-		// Mark resource as having policy violations
-		annotations[PolicyViolationAnnotation] = "true"
+	// Copia de las anotaciones originales para comparar
+	original := make(map[string]string, len(annotations))
+	for k, v := range annotations {
+		original[k] = v
+	}
 
-		// Build detailed violation information for each policy violation
+	if len(violations) > 0 {
+		annotations[PolicyViolationAnnotation] = "true"
 		var details []string
 		for _, v := range violations {
-			detail := fmt.Sprintf("Policy: %s, Rule: %s, Severity: %s, Message: %s",
-				v.PolicyName, v.RuleName, v.Severity, v.ErrorMessage)
+			detail := fmt.Sprintf("Policy: %s, Rule: %s, Message: %s",
+				v.PolicyName, v.RuleName, v.ErrorMessage)
 			details = append(details, detail)
 		}
-		// Combine all violation details into a single annotation value
 		annotations[ViolationDetailsAnnotation] = strings.Join(details, "; ")
 	} else {
-		// No violations found - remove violation annotations to clean up the resource
 		delete(annotations, PolicyViolationAnnotation)
 		delete(annotations, ViolationDetailsAnnotation)
 	}
 
-	// Apply the updated annotations to the resource
-	resource.SetAnnotations(annotations)
-
-	// Persist the annotation changes to the Kubernetes cluster
-	if err := r.Update(ctx, resource); err != nil {
-		logger.Error(err, "Failed to update resource annotations",
-			"name", resource.GetName(),
-			"namespace", resource.GetNamespace())
-		errorTotal.WithLabelValues("failed_update_resource_annotations", resource.GetKind()).Inc()
-		return err
+	// Solo actualiza si hay cambios reales
+	changed := false
+	if len(annotations) != len(original) {
+		changed = true
+	} else {
+		for k, v := range annotations {
+			if original[k] != v {
+				changed = true
+				break
+			}
+		}
 	}
-
+	if changed {
+		resource.SetAnnotations(annotations)
+		if err := r.Update(ctx, resource); err != nil {
+			logger.Error(err, "Failed to update resource annotations",
+				"name", resource.GetName(),
+				"namespace", resource.GetNamespace())
+			return err
+		}
+	}
 	return nil
 }
 
@@ -214,32 +183,42 @@ func (r *ClusterPolicyValidatorReconciler) clearViolationAnnotations(
 	resource *unstructured.Unstructured,
 	logger logr.Logger,
 ) {
-	// Get current annotations, return early if none exist
 	annotations := resource.GetAnnotations()
 	if annotations == nil {
 		return
 	}
-
-	// Check if violation annotations are present before attempting removal
 	if _, exists := annotations[PolicyViolationAnnotation]; !exists {
 		return
 	}
-
-	// Remove both violation-related annotations
+	original := make(map[string]string, len(annotations))
+	for k, v := range annotations {
+		original[k] = v
+	}
 	delete(annotations, PolicyViolationAnnotation)
 	delete(annotations, ViolationDetailsAnnotation)
-	resource.SetAnnotations(annotations)
-
-	// Persist the annotation changes to the Kubernetes cluster
-	if err := r.Update(ctx, resource); err != nil {
-		logger.Error(err, "Failed to clear violation annotations",
-			"name", resource.GetName(),
-			"namespace", resource.GetNamespace())
-		errorTotal.WithLabelValues("failed_clear_violation_annotations", resource.GetKind()).Inc()
+	delete(annotations, "k8lex.io/clusterpolicyupdater")
+	changed := false
+	if len(annotations) != len(original) {
+		changed = true
 	} else {
-		logger.V(1).Info("Cleared violation annotations",
-			"name", resource.GetName(),
-			"namespace", resource.GetNamespace())
+		for k, v := range annotations {
+			if original[k] != v {
+				changed = true
+				break
+			}
+		}
+	}
+	if changed {
+		resource.SetAnnotations(annotations)
+		if err := r.Update(ctx, resource); err != nil {
+			logger.Error(err, "Failed to clear violation annotations",
+				"name", resource.GetName(),
+				"namespace", resource.GetNamespace())
+		} else {
+			logger.V(1).Info("Cleared violation annotations",
+				"name", resource.GetName(),
+				"namespace", resource.GetNamespace())
+		}
 	}
 }
 
@@ -294,8 +273,6 @@ func (r *ClusterPolicyValidatorReconciler) shouldBypassPolicies(resource client.
 		r.Log.Info("Emergency policy bypass detected",
 			"resource", resource.GetName(),
 			"namespace", resource.GetNamespace())
-		// Track emergency bypasses separately in metrics for audit purposes
-		policyBypassTotal.WithLabelValues("emergency", resource.GetObjectKind().GroupVersionKind().Kind).Inc()
 		return true
 	}
 
@@ -304,8 +281,6 @@ func (r *ClusterPolicyValidatorReconciler) shouldBypassPolicies(resource client.
 		r.Log.Info("Policy bypass detected",
 			"resource", resource.GetName(),
 			"namespace", resource.GetNamespace())
-		// Track regular bypasses in metrics
-		policyBypassTotal.WithLabelValues("regular", resource.GetObjectKind().GroupVersionKind().Kind).Inc()
 		return true
 	}
 

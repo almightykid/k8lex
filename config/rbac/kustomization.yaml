@@ -24,10 +24,6 @@ resources:
 # if you do not want those helpers be installed with your Project.
 - clusterpolicynotifier_clusterpolicynotifier_editor_role.yaml
 - clusterpolicynotifier_clusterpolicynotifier_viewer_role.yaml
-- clusterpolicyset_clusterpolicyset_editor_role.yaml
-- clusterpolicyset_clusterpolicyset_viewer_role.yaml
-- clusterpolicyupdater_clusterpolicyupdater_editor_role.yaml
-- clusterpolicyupdater_clusterpolicyupdater_viewer_role.yaml
 - clusterpolicyvalidator_clusterpolicyvalidator_editor_role.yaml
 - clusterpolicyvalidator_clusterpolicyvalidator_viewer_role.yaml
 

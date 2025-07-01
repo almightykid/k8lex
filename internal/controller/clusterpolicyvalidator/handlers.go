@@ -7,6 +7,8 @@ import (
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 
+	clusterpolicynotifierv1alpha1 "github.com/almightykid/k8lex/api/clusterpolicynotifier/v1alpha1"
+	clusterpolicyvalidatorv1alpha1 "github.com/almightykid/k8lex/api/clusterpolicyvalidator/v1alpha1"
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -30,23 +32,26 @@ func (r *ClusterPolicyValidatorReconciler) handleViolations(
 	resource *unstructured.Unstructured, // The unstructured representation of the resource.
 	resourceGVK schema.GroupVersionKind, // The GroupVersionKind of the resource.
 	violations []ValidationResult, // A slice of policy violations detected for the resource.
+	policies []clusterpolicyvalidatorv1alpha1.ClusterPolicyValidator, // Lista de policies para buscar el mensaje personalizado.
 	logger logr.Logger, // Logger for structured logging.
 ) (ctrl.Result, error) {
 	// Iterate over each detected violation.
 	for _, violation := range violations {
-		// Record Prometheus metrics for policy violations and actions taken.
-		policyViolations.WithLabelValues(violation.PolicyName, resourceGVK.Kind, violation.Severity, violation.Action).Inc()
-		actionTakenTotal.WithLabelValues(violation.Action, resourceGVK.Kind, violation.Severity).Inc()
-
 		// Execute the action defined by the policy (e.g., "block", "warn", "audit").
-		if err := r.handleResourceAction(ctx, foundResource, resourceGVK.Kind, violation, logger); err != nil {
-			// If an error occurs during action handling, requeue the reconciliation
-			// after a default delay to retry the operation.
+		if err := r.handleResourceAction(ctx, foundResource, resourceGVK.Kind, violation, policies, logger); err != nil {
+			// If an error occurs during action handling, check if it's a retryable error
 			logger.Error(err, "Failed to handle resource action for violation",
 				"resource", foundResource.GetName(),
 				"policy", violation.PolicyName,
 				"action", violation.Action)
-			return ctrl.Result{RequeueAfter: DefaultRequeueDelay}, err
+
+			// For conflict errors, let controller-runtime handle the retry automatically
+			if apierrors.IsConflict(err) {
+				return ctrl.Result{}, err
+			}
+
+			// For other errors, requeue after a delay
+			return ctrl.Result{RequeueAfter: DefaultRequeueDelay}, nil
 		}
 
 		// If the action taken was "block", stop processing further violations for this resource.
@@ -58,18 +63,7 @@ func (r *ClusterPolicyValidatorReconciler) handleViolations(
 				"resource", foundResource.GetName(),
 				"kind", resourceGVK.Kind)
 
-			if err := r.SendPolicyViolationNotification(ctx, foundResource.GetName(), violation.RuleName, violation.ErrorMessage); err != nil {
-				logger.Error(err, "Failed to send policy violation notification",
-					"resource", foundResource.GetName(),
-					"policy", violation.PolicyName,
-					"rule", violation.RuleName)
-			} else {
-				logger.Info("Policy violation notification sent successfully",
-					"resource", foundResource.GetName(),
-					"policy", violation.PolicyName)
-			}
-
-			logger.Info("Blocking action taken, no further violations processed for this resource - Notification sent")
+			logger.Info("Blocking action taken, no further violations processed for this resource")
 			return ctrl.Result{}, nil // Return an empty result, indicating no requeue is immediately needed.
 		}
 	}
@@ -87,6 +81,7 @@ func (r *ClusterPolicyValidatorReconciler) handleResourceAction(
 	resource client.Object, // The Kubernetes resource (e.g., Pod, Deployment) that violated the policy.
 	kind string, // The Kind of the resource (e.g., "Pod", "Deployment").
 	violation ValidationResult, // The details of the policy violation, including the action to take.
+	policies []clusterpolicyvalidatorv1alpha1.ClusterPolicyValidator, // Lista de policies para buscar el updater.
 	logger logr.Logger, // Logger for structured logging.
 ) error {
 	resourceName := resource.GetName()
@@ -99,14 +94,12 @@ func (r *ClusterPolicyValidatorReconciler) handleResourceAction(
 		"kind", kind,
 		"policy", violation.PolicyName,
 		"rule", violation.RuleName,
-		"action", violation.Action,
-		"severity", violation.Severity,
-		"errorMessage", violation.ErrorMessage)
+		"action", violation.Action)
 
 	// Use a switch statement to dispatch to the specific handler function for each action type.
 	switch strings.ToLower(violation.Action) {
 	case "block":
-		return r.handleBlockAction(ctx, resource, kind, violation, logger)
+		return r.handleBlockAction(ctx, resource, kind, violation, policies, logger)
 	case "warn":
 		return r.handleWarnAction(ctx, resource, violation, logger)
 	case "audit":
@@ -134,16 +127,17 @@ func (r *ClusterPolicyValidatorReconciler) handleBlockAction(
 	resource client.Object, // The Kubernetes resource to block.
 	kind string, // The Kind of the resource (e.g., "Pod", "Deployment").
 	violation ValidationResult, // Details of the violation leading to blocking.
+	policies []clusterpolicyvalidatorv1alpha1.ClusterPolicyValidator, // Lista de policies para buscar el updater.
 	logger logr.Logger, // Logger for structured logging.
 ) error {
 	// Dispatch to specialized blocking functions based on resource Kind.
 	switch kind {
 	case "Pod":
 		// Pods might need special handling if they are managed by a controller (e.g., Deployment).
-		return r.handlePodBlocking(ctx, resource, violation, logger)
+		return r.handlePodBlocking(ctx, resource, violation, policies, logger)
 	case "Deployment", "ReplicaSet", "DaemonSet", "StatefulSet":
 		// Controller resources are typically scaled down to zero to prevent them from running.
-		return r.handleControllerBlocking(ctx, resource, violation, logger)
+		return r.handleControllerBlocking(ctx, resource, violation, policies, logger)
 	default:
 		// For all other resource types, a generic deletion is applied.
 		return r.handleGenericResourceBlocking(ctx, resource, violation, logger)
@@ -158,6 +152,7 @@ func (r *ClusterPolicyValidatorReconciler) handlePodBlocking(
 	ctx context.Context,
 	resource client.Object, // The Pod resource to block.
 	violation ValidationResult, // Details of the violation.
+	policies []clusterpolicyvalidatorv1alpha1.ClusterPolicyValidator, // Lista de policies para buscar el updater.
 	logger logr.Logger, // Logger for structured logging.
 ) error {
 	// Check if the Pod has owner references, indicating it's managed by a controller.
@@ -172,7 +167,7 @@ func (r *ClusterPolicyValidatorReconciler) handlePodBlocking(
 					"namespace", resource.GetNamespace(),
 					"replicaSet", ownerRef.Name)
 				// Delegate to a helper function that finds and blocks the parent Deployment.
-				return r.handleDeploymentViolation(ctx, resource.GetNamespace(), ownerRef.Name, violation, logger)
+				return r.handleDeploymentViolation(ctx, resource.GetNamespace(), ownerRef.Name, violation, policies, logger)
 			}
 			// Add checks for other controller types if needed (e.g., StatefulSet, DaemonSet directly).
 		}
@@ -187,7 +182,6 @@ func (r *ClusterPolicyValidatorReconciler) handlePodBlocking(
 	if err := r.Delete(ctx, resource); client.IgnoreNotFound(err) != nil {
 		// Log and return error if deletion fails, ignoring "not found" errors which mean it's already gone.
 		logger.Error(err, "Failed to delete standalone Pod", "pod", resource.GetName())
-		errorTotal.WithLabelValues("failed_to_delete_pod", "Pod").Inc() // Metric for deletion failures.
 		return err
 	}
 
@@ -206,8 +200,16 @@ func (r *ClusterPolicyValidatorReconciler) handleControllerBlocking(
 	ctx context.Context,
 	resource client.Object, // The controller resource to block.
 	violation ValidationResult, // Details of the policy violation.
+	policies []clusterpolicyvalidatorv1alpha1.ClusterPolicyValidator, // Lista de policies para buscar el updater.
 	logger logr.Logger, // Logger for structured logging.
 ) error {
+	// Validate input parameters
+	if resource == nil {
+		return fmt.Errorf("resource cannot be nil")
+	}
+	if r.EventRecorder == nil {
+		return fmt.Errorf("event recorder is not initialized")
+	}
 	// Convert the `client.Object` to `*unstructured.Unstructured`.
 	// This is necessary to manipulate generic fields like `spec.replicas` directly.
 	unstructuredObj, ok := resource.(*unstructured.Unstructured)
@@ -251,7 +253,6 @@ func (r *ClusterPolicyValidatorReconciler) handleControllerBlocking(
 				"kind", unstructuredObj.GetKind(),
 				"resource", resource.GetName(),
 				"namespace", resource.GetNamespace())
-			errorTotal.WithLabelValues("failed_set_replicas_to_zero", unstructuredObj.GetKind()).Inc()
 			return err
 		}
 		logger.Info("Scaling resource to 0 due to policy violation",
@@ -264,25 +265,30 @@ func (r *ClusterPolicyValidatorReconciler) handleControllerBlocking(
 
 	// Add or update specific annotations on the resource to mark it as blocked
 	// and store its original replica count for potential future unblocking.
-	annotations := resource.GetAnnotations()
+	annotations := unstructuredObj.GetAnnotations()
 	if annotations == nil {
 		annotations = make(map[string]string)
+	}
+	// Evitar doble acción: si ya está bloqueado y tiene anotación de updater, no hacer nada
+	if annotations[PolicyBlockedAnnotation] == "true" && annotations["k8lex.io/clusterpolicyupdater"] != "" {
+		logger.Info("Resource already blocked and annotated for updater; skipping duplicate action",
+			"resource", resource.GetName(), "namespace", resource.GetNamespace())
+		return nil
+	}
+	// Obtener el nombre del updater de la regla
+	updaterName := getUpdaterNameFromViolation(violation, policies)
+	if updaterName == "" {
+		logger.Error(nil, "No updater name specified in rule; skipping updater annotation",
+			"resource", resource.GetName(), "policy", violation.PolicyName, "rule", violation.RuleName)
+	} else {
+		annotations["k8lex.io/clusterpolicyupdater"] = updaterName
 	}
 	annotations[PolicyBlockedAnnotation] = "true"
 	annotations[OriginalReplicasAnnotation] = fmt.Sprintf("%d", currentReplicas)
 	annotations[BlockedReasonAnnotation] = violation.ErrorMessage // Provide the reason for blocking.
-	resource.SetAnnotations(annotations)
+	unstructuredObj.SetAnnotations(annotations)
 
 	// Update the resource in Kubernetes API.
-	if err := r.Update(ctx, unstructuredObj); err != nil {
-		logger.Error(err, "Failed to update resource (scale down and annotate)",
-			"kind", unstructuredObj.GetKind(),
-			"resource", resource.GetName(),
-			"namespace", resource.GetNamespace())
-		errorTotal.WithLabelValues("failed_scale_down_and_annotate", unstructuredObj.GetKind()).Inc()
-		return err
-	}
-
 	if err := r.Update(ctx, unstructuredObj); err != nil {
 		if apierrors.IsConflict(err) {
 			logger.Info("Resource update conflict - controller will retry automatically",
@@ -290,19 +296,69 @@ func (r *ClusterPolicyValidatorReconciler) handleControllerBlocking(
 				"resource", resource.GetName(),
 				"namespace", resource.GetNamespace(),
 				"behavior", "automatic_retry_by_controller_runtime")
+			return err // Return the conflict error to trigger requeue
 		} else {
 			logger.Error(err, "Failed to update resource (non-conflict error)",
 				"kind", unstructuredObj.GetKind(),
 				"resource", resource.GetName(),
 				"namespace", resource.GetNamespace())
-			errorTotal.WithLabelValues("failed_scale_down_and_annotate", unstructuredObj.GetKind()).Inc()
+			return err
 		}
-		return err
 	}
 
 	// Record a Kubernetes event to signal the resource has been scaled down due to policy violation.
-	r.EventRecorder.Eventf(resource, corev1.EventTypeWarning, "PolicyViolation",
-		"Resource %s scaled to 0 due to policy violation: %s", resource.GetName(), violation.ErrorMessage)
+	eventMessage := fmt.Sprintf("Resource %s scaled to 0 due to policy violation (Policy: %s, Rule: %s): %s",
+		unstructuredObj.GetName(), violation.PolicyName, violation.RuleName, violation.ErrorMessage)
+	r.EventRecorder.Eventf(unstructuredObj, corev1.EventTypeWarning, "PolicyViolation", eventMessage)
+
+	// Send notification to Slack if enabled and resource was actually scaled down (not already blocked)
+	wasAlreadyBlocked := annotations[PolicyBlockedAnnotation] == "true" && annotations["k8lex.io/clusterpolicyupdater"] != ""
+
+	if !wasAlreadyBlocked {
+		var notificationEnabled bool
+		var notifierRef clusterpolicyvalidatorv1alpha1.Ref
+		var customMessage string = violation.ErrorMessage
+
+		// Find notification configuration from policies
+		for _, policy := range policies {
+			if policy.Name == violation.PolicyName {
+				for _, rule := range policy.Spec.ValidationRules {
+					if rule.Name == violation.RuleName {
+						if rule.Notification.Message != "" {
+							customMessage = rule.Notification.Message
+						}
+						notificationEnabled = rule.Notification.Enabled
+						notifierRef = rule.Notification.NotifierRef
+						break
+					}
+				}
+				break
+			}
+		}
+
+		// Send notification if enabled and notifier exists
+		if notificationEnabled && isNotifierEnabledAndExists(ctx, r.Client, notifierRef, logger) {
+			if err := r.SendPolicyViolationNotification(ctx, unstructuredObj.GetName(), violation.RuleName, customMessage); err != nil {
+				logger.Error(err, "Failed to send policy violation notification",
+					"resource", unstructuredObj.GetName(),
+					"policy", violation.PolicyName,
+					"rule", violation.RuleName)
+			} else {
+				logger.Info("Policy violation notification sent successfully",
+					"resource", unstructuredObj.GetName(),
+					"policy", violation.PolicyName)
+			}
+		} else {
+			logger.Info("Notification not sent: not enabled or notifier does not exist",
+				"resource", unstructuredObj.GetName(),
+				"policy", violation.PolicyName,
+				"rule", violation.RuleName)
+		}
+	} else {
+		logger.Info("Notification skipped: resource was already blocked",
+			"resource", unstructuredObj.GetName(),
+			"policy", violation.PolicyName)
+	}
 
 	return nil // Successfully scaled down and annotated.
 }
@@ -328,7 +384,6 @@ func (r *ClusterPolicyValidatorReconciler) handleGenericResourceBlocking(
 			"kind", resource.GetObjectKind().GroupVersionKind().Kind,
 			"resource", resource.GetName(),
 			"namespace", resource.GetNamespace())
-		errorTotal.WithLabelValues("failed_to_delete_resource", resource.GetObjectKind().GroupVersionKind().Kind).Inc()
 		return err
 	}
 
@@ -354,13 +409,12 @@ func (r *ClusterPolicyValidatorReconciler) handleWarnAction(
 		"kind", resource.GetObjectKind().GroupVersionKind().Kind,
 		"policy", violation.PolicyName,
 		"rule", violation.RuleName,
-		"severity", violation.Severity,
 		"message", violation.ErrorMessage)
 
 	// Emit a Kubernetes event of type "Warning" on the resource.
 	r.EventRecorder.Eventf(resource, corev1.EventTypeWarning, "PolicyViolation",
-		"Policy violation detected for resource %s: %s (Policy: %s, Rule: %s, Severity: %s)",
-		resource.GetName(), violation.ErrorMessage, violation.PolicyName, violation.RuleName, violation.Severity)
+		"Policy violation detected for resource %s: %s (Policy: %s, Rule: %s)",
+		resource.GetName(), violation.ErrorMessage, violation.PolicyName, violation.RuleName)
 	return nil
 }
 
@@ -379,13 +433,12 @@ func (r *ClusterPolicyValidatorReconciler) handleAuditAction(
 		"kind", resource.GetObjectKind().GroupVersionKind().Kind,
 		"policy", violation.PolicyName,
 		"rule", violation.RuleName,
-		"severity", violation.Severity,
 		"message", violation.ErrorMessage)
 
 	// Emit a Kubernetes event of type "Normal" (informational) on the resource.
 	r.EventRecorder.Eventf(resource, corev1.EventTypeNormal, "PolicyAudit",
-		"Policy audit: Resource %s flagged by policy %s (Rule: %s, Severity: %s)",
-		resource.GetName(), violation.PolicyName, violation.RuleName, violation.Severity)
+		"Policy audit: Resource %s flagged by policy %s (Rule: %s)",
+		resource.GetName(), violation.PolicyName, violation.RuleName)
 	return nil
 }
 
@@ -397,6 +450,7 @@ func (r *ClusterPolicyValidatorReconciler) handleDeploymentViolation(
 	ctx context.Context,
 	namespace, replicaSetName string, // Namespace and name of the ReplicaSet owner.
 	violation ValidationResult, // Details of the violation to apply to the Deployment.
+	policies []clusterpolicyvalidatorv1alpha1.ClusterPolicyValidator, // Lista de policies para buscar el updater.
 	logger logr.Logger, // Logger for structured logging.
 ) error {
 	// Step 1: Get the ReplicaSet that owns the violating Pod.
@@ -436,11 +490,45 @@ func (r *ClusterPolicyValidatorReconciler) handleDeploymentViolation(
 
 			// Step 5: If the Deployment is not already blocked, apply the blocking action to it.
 			// This will scale down the Deployment to zero and add the necessary annotations.
-			return r.handleControllerBlocking(ctx, deployment, violation, logger)
+			return r.handleControllerBlocking(ctx, deployment, violation, policies, logger)
 		}
 	}
 
 	// If no parent Deployment is found for the ReplicaSet, return an error.
 	logger.Error(nil, "No parent Deployment found for ReplicaSet", "replicaSet", replicaSetName, "namespace", namespace)
 	return fmt.Errorf("no parent Deployment found for ReplicaSet %s in namespace %s", replicaSetName, namespace)
+}
+
+// Helper para obtener el nombre del updater de la regla que ha generado la violación
+func getUpdaterNameFromViolation(violation ValidationResult, policies []clusterpolicyvalidatorv1alpha1.ClusterPolicyValidator) string {
+	for _, policy := range policies {
+		if policy.Name == violation.PolicyName {
+			for _, rule := range policy.Spec.ValidationRules {
+				if rule.Name == violation.RuleName {
+					// Return the updater name, not the notifier name
+					return rule.Update.UpdaterRef.Name
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// Helper para verificar si el Notifier está habilitado y existe
+func isNotifierEnabledAndExists(ctx context.Context, c client.Client, notifierRef clusterpolicyvalidatorv1alpha1.Ref, logger logr.Logger) bool {
+	if notifierRef.Name == "" {
+		logger.Info("NotifierRef.Name is empty, skipping notification")
+		return false
+	}
+	notifier := &clusterpolicynotifierv1alpha1.ClusterPolicyNotifier{}
+	err := c.Get(ctx, types.NamespacedName{Name: notifierRef.Name, Namespace: notifierRef.Namespace}, notifier)
+	if err != nil {
+		logger.Info("Notifier resource not found, skipping notification", "name", notifierRef.Name, "namespace", notifierRef.Namespace)
+		return false
+	}
+	if notifier.Status.Phase != clusterpolicynotifierv1alpha1.NotifierPhaseReady {
+		logger.Info("Notifier resource exists but is not Ready, skipping notification", "name", notifierRef.Name, "namespace", notifierRef.Namespace, "phase", notifier.Status.Phase)
+		return false
+	}
+	return true
 }

@@ -28,10 +28,6 @@ type ClusterPolicyNotifierSpec struct {
 	// Slack webhook URL for sending notifications
 	// +kubebuilder:validation:Required
 	SlackWebhookUrl string `json:"slackWebhookUrl"`
-
-	// Message to be sent via Slack
-	// +kubebuilder:validation:Required
-	Message string `json:"message"`
 }
 
 // ClusterPolicyNotifierStatus defines the observed state of ClusterPolicyNotifier
@@ -120,13 +116,9 @@ func ValidateWebhookURL(url string) bool {
 // Validate validates the ClusterPolicyNotifier configuration
 func (c *ClusterPolicyNotifier) Validate() error {
 	// Validate Slack webhook URL
+
 	if !ValidateWebhookURL(c.Spec.SlackWebhookUrl) {
 		return errors.New("invalid Slack webhook URL: must start with https://hooks.slack.com/")
-	}
-
-	// Validate message is not empty
-	if strings.TrimSpace(c.Spec.Message) == "" {
-		return errors.New("message cannot be empty")
 	}
 
 	return nil

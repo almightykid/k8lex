@@ -4,7 +4,6 @@
 resources:
 - bases/clusterpolicyvalidator.k8lex.io_clusterpolicyvalidators.yaml
 - bases/clusterpolicyupdater.k8lex.io_clusterpolicyupdaters.yaml
-- bases/clusterpolicyset.k8lex.io_clusterpolicysets.yaml
 - bases/clusterpolicynotifier.k8lex.io_clusterpolicynotifiers.yaml
 # +kubebuilder:scaffold:crdkustomizeresource
 

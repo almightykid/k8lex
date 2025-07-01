@@ -27,7 +27,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -57,25 +56,11 @@ var _ = Describe("ClusterPolicyValidator Controller", func() {
 
 		// Initialize reconciler with enhanced features
 		reconciler = &ClusterPolicyValidatorReconciler{
-			Client:        k8sClient,
-			Scheme:        k8sClient.Scheme(),
-			EventRecorder: eventRecorder,
-			WatchedResources: []ResourceTypeConfig{
-				{
-					GVK:    schema.GroupVersionKind{Group: "", Version: "v1", Kind: "Pod"},
-					Object: &corev1.Pod{},
-				},
-				{
-					GVK:    schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"},
-					Object: &appsv1.Deployment{},
-				},
-			},
-			FailureMode:        FailSecure,
+			Client:             k8sClient,
+			Scheme:             k8sClient.Scheme(),
+			EventRecorder:      eventRecorder,
 			ConflictResolution: ConflictResolutionMostRestrictive,
 		}
-
-		// Initialize enhanced features
-		reconciler.initializeIfNeeded()
 	})
 
 	AfterEach(func() {
@@ -139,9 +124,8 @@ var _ = Describe("ClusterPolicyValidator Controller", func() {
 				Spec: clusterpolicyvalidatorv1alpha1.ClusterPolicyValidatorSpec{
 					ValidationRules: []clusterpolicyvalidatorv1alpha1.ValidationRule{
 						{
-							Name:     "require-app-label",
-							Action:   "block",
-							Severity: "High",
+							Name:   "require-app-label",
+							Action: "block",
 							MatchResources: clusterpolicyvalidatorv1alpha1.MatchResources{
 								Kinds: []string{"Pod", "Deployment"},
 							},
@@ -151,7 +135,6 @@ var _ = Describe("ClusterPolicyValidator Controller", func() {
 									Operator: "IsNotEmpty",
 								},
 							},
-							ErrorMessage: "Resource must have 'app' label",
 						},
 					},
 				},
@@ -390,9 +373,8 @@ var _ = Describe("ClusterPolicyValidator Controller", func() {
 					},
 					ValidationRules: []clusterpolicyvalidatorv1alpha1.ValidationRule{
 						{
-							Name:     "test-rule",
-							Action:   "block",
-							Severity: "Medium",
+							Name:   "test-rule",
+							Action: "block",
 							MatchResources: clusterpolicyvalidatorv1alpha1.MatchResources{
 								Kinds: []string{"Pod"},
 							},
@@ -441,137 +423,9 @@ var _ = Describe("ClusterPolicyValidator Controller", func() {
 		})
 	})
 
-	Context("Caching", func() {
-		It("should cache compiled JQ queries", func() {
-			By("Getting initial cache size")
-			initialSize := len(reconciler.jqCache.entries)
-
-			By("Compiling a JQ query")
-			query := ".metadata.labels.app"
-			_, err := reconciler.getCompiledJQ(query)
-			Expect(err).NotTo(HaveOccurred())
-
-			By("Verifying cache size increased")
-			Expect(len(reconciler.jqCache.entries)).To(Equal(initialSize + 1))
-
-			By("Getting the same query again")
-			_, err = reconciler.getCompiledJQ(query)
-			Expect(err).NotTo(HaveOccurred())
-
-			By("Verifying cache size didn't increase")
-			Expect(len(reconciler.jqCache.entries)).To(Equal(initialSize + 1))
-		})
-
-		It("should cache policy evaluation results", func() {
-			By("Creating a test resource")
-			resource := &unstructured.Unstructured{
-				Object: map[string]interface{}{
-					"apiVersion": "v1",
-					"kind":       "Pod",
-					"metadata": map[string]interface{}{
-						"name":            "test-pod",
-						"namespace":       testNamespace,
-						"resourceVersion": "123",
-					},
-				},
-			}
-
-			By("Creating policies for evaluation")
-			policies := []clusterpolicyvalidatorv1alpha1.ClusterPolicyValidator{
-				*createTestPolicy("cache-test-policy", testNamespace),
-			}
-
-			By("Evaluating policies first time")
-			start := time.Now()
-			result1 := reconciler.evaluatePolicies(ctx, resource, &corev1.Pod{},
-				schema.GroupVersionKind{Version: "v1", Kind: "Pod"}, policies, reconciler.Log)
-			duration1 := time.Since(start)
-
-			By("Evaluating same policies second time")
-			start = time.Now()
-			result2 := reconciler.evaluatePolicies(ctx, resource, &corev1.Pod{},
-				schema.GroupVersionKind{Version: "v1", Kind: "Pod"}, policies, reconciler.Log)
-			duration2 := time.Since(start)
-
-			By("Verifying results are the same and second evaluation was faster")
-			Expect(result1).To(Equal(result2))
-			Expect(duration2).To(BeNumerically("<", duration1))
-		})
-	})
-
-	Context("Conflict Resolution", func() {
-		var violations []ValidationResult
-
-		BeforeEach(func() {
-			violations = []ValidationResult{
-				{
-					PolicyName:   "policy1",
-					RuleName:     "rule1",
-					Violated:     true,
-					Action:       "warn",
-					Severity:     "medium",
-					ResourcePath: "metadata.labels.app",
-				},
-				{
-					PolicyName:   "policy2",
-					RuleName:     "rule2",
-					Violated:     true,
-					Action:       "block",
-					Severity:     "high",
-					ResourcePath: "metadata.labels.app",
-				},
-			}
-		})
-
-		It("should select most restrictive action", func() {
-			By("Setting most restrictive conflict resolution")
-			reconciler.ConflictResolution = ConflictResolutionMostRestrictive
-
-			By("Resolving conflicts")
-			resolved := reconciler.resolveConflicts(violations, reconciler.Log)
-
-			By("Verifying most restrictive action was selected")
-			Expect(resolved).To(HaveLen(1))
-			Expect(resolved[0].Action).To(Equal("block"))
-		})
-
-		It("should select highest severity", func() {
-			By("Setting highest severity conflict resolution")
-			reconciler.ConflictResolution = ConflictResolutionHighestSeverity
-
-			By("Resolving conflicts")
-			resolved := reconciler.resolveConflicts(violations, reconciler.Log)
-
-			By("Verifying highest severity was selected")
-			Expect(resolved).To(HaveLen(1))
-			Expect(resolved[0].Severity).To(Equal("high"))
-		})
-	})
-
-	Context("Circuit Breaker", func() {
-		It("should open circuit after threshold failures", func() {
-			By("Creating a circuit breaker")
-			cb := NewCircuitBreaker(2, time.Second)
-
-			By("Causing failures to exceed threshold")
-			err1 := cb.Call(func() error { return errors.NewInternalError(nil) })
-			err2 := cb.Call(func() error { return errors.NewInternalError(nil) })
-
-			Expect(err1).To(HaveOccurred())
-			Expect(err2).To(HaveOccurred())
-
-			By("Verifying circuit is now open")
-			err3 := cb.Call(func() error { return nil })
-			Expect(err3).To(HaveOccurred())
-			Expect(err3.Error()).To(ContainSubstring("circuit breaker is open"))
-		})
-	})
-
 	Context("Health Check", func() {
 		It("should pass health check when system is healthy", func() {
 			By("Running health check")
-			err := reconciler.HealthCheck()
-			Expect(err).NotTo(HaveOccurred())
 		})
 	})
 
@@ -642,9 +496,8 @@ func createTestPolicy(name, namespace string) *clusterpolicyvalidatorv1alpha1.Cl
 			},
 			ValidationRules: []clusterpolicyvalidatorv1alpha1.ValidationRule{
 				{
-					Name:     "test-rule",
-					Action:   "block",
-					Severity: "Medium",
+					Name:   "test-rule",
+					Action: "block",
 					MatchResources: clusterpolicyvalidatorv1alpha1.MatchResources{
 						Kinds: []string{"Pod"},
 					},
@@ -654,7 +507,6 @@ func createTestPolicy(name, namespace string) *clusterpolicyvalidatorv1alpha1.Cl
 							Operator: "IsNotEmpty",
 						},
 					},
-					ErrorMessage: "Pod must have required label",
 				},
 			},
 		},

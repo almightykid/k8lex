@@ -48,7 +48,7 @@ func (r *ClusterPolicyNotifierReconciler) Reconcile(ctx context.Context, req ctr
 	var notifier policyv1alpha1.ClusterPolicyNotifier
 	if err := r.Get(ctx, req.NamespacedName, &notifier); err != nil {
 		if errors.IsNotFound(err) {
-			logger.Info("ClusterPolicyNotifier resource not found. Ignoring since object must be deleted")
+			logger.Info("ClusterPolicyNotifier resource not found. Ignoring since object must have been deleted")
 			return ctrl.Result{}, nil
 		}
 		logger.Error(err, "Failed to get ClusterPolicyNotifier")
@@ -75,7 +75,7 @@ func (r *ClusterPolicyNotifierReconciler) Reconcile(ctx context.Context, req ctr
 	logger.Info("ClusterPolicyNotifier validation successful")
 
 	// Test the webhook by sending the configured message
-	if err := r.sendSlackMessage(ctx, notifier.Spec.SlackWebhookUrl, notifier.Spec.Message); err != nil {
+	if err := r.sendSlackMessage(ctx, notifier.Spec.SlackWebhookUrl, notifier.Name+" successfully connected to this channel."); err != nil {
 		logger.Error(err, "Failed to send test message to Slack")
 		return r.updateStatus(ctx, &notifier, policyv1alpha1.NotifierPhaseError, fmt.Sprintf("Webhook test failed: %v", err))
 	}

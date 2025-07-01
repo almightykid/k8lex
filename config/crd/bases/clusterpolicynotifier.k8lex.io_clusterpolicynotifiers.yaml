@@ -53,14 +53,10 @@ spec:
           spec:
             description: ClusterPolicyNotifierSpec defines the desired state of ClusterPolicyNotifier
             properties:
-              message:
-                description: Message to be sent via Slack
-                type: string
               slackWebhookUrl:
                 description: Slack webhook URL for sending notifications
                 type: string
             required:
-            - message
             - slackWebhookUrl
             type: object
           status:
