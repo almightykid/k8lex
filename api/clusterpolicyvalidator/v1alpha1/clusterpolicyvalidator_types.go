@@ -25,9 +25,6 @@ type ClusterPolicyValidatorSpec struct {
 	Description     string           `json:"description,omitempty"`     // Description of the cluster policy validator
 	Namespaces      Namespace        `json:"namespaces,omitempty"`      // List of namespaces to exclude from validation
 	ValidationRules []ValidationRule `json:"validationRules,omitempty"` // List of validation rules
-	Notification    Notification     `json:"notification,omitempty"`    // Notification configuration
-	ErrorMessage    string           `json:"errorMessage,omitempty"`    // Default error message for validation failures
-	Severity        string           `json:"severity,omitempty"`        // Default severity for validation errors
 }
 
 type Namespace struct {
@@ -36,32 +33,34 @@ type Namespace struct {
 }
 
 type Notification struct {
-	Enabled     bool `json:"enabled,omitempty"`     // If notifications are enabled
-	NotifierRef Ref  `json:"notifierRef,omitempty"` // Reference to the notifier (e.g., Slack, email)
+	Enabled     bool   `json:"enabled,omitempty"` // If notifications are enabled
+	Message     string `json:"message,omitempty"` // Message to send in the notification
+	NotifierRef Ref    `json:"notifierRef"`       // Reference to the notifier (e.g., Slack, email, updater name). Name is required.
 }
 
 type Ref struct {
-	Name      string `json:"name,omitempty"`      // Name of the notifier
+	Name      string `json:"name"`                // Name of the notifier or updater (required)
 	Namespace string `json:"namespace,omitempty"` // Namespace of the notifier
 }
 
 type ValidationRule struct {
-	Name              string            `json:"name"`                  // Name of the validation rule
-	Description       string            `json:"description,omitempty"` // Optional description of the rule
-	Severity          string            `json:"severity,omitempty"`    // Severity of the validation
-	ErrorMessage      string            `json:"errorMessage"`
+	Name              string            `json:"name"`                        // Name of the validation rule
+	Description       string            `json:"description,omitempty"`       // Optional description of the rule
 	MatchResources    MatchResources    `json:"matchResources"`              // Resources to which this rule applies
 	Conditions        []Condition       `json:"conditions"`                  // Conditions for rule matching
 	Action            string            `json:"action,omitempty"`            // Action to take when the rule matches
 	NamespaceSelector NamespaceSelector `json:"namespaceSelector,omitempty"` // Namespace selector for the rule
-	LabelSelector     LabelSelector     `json:"labelSelector,omitempty"`     // Label selector for the rule
+	Notification      Notification      `json:"notification,omitempty"`      // Notification configuration for this rule
+	Update            Update            `json:"update,omitempty"`            // Reference to the updater for this rule
+}
+
+type Update struct {
+	Enabled    bool `json:"enabled,omitempty"`
+	UpdaterRef Ref  `json:"updaterRef,omitempty"`
 }
 
 type NamespaceSelector struct {
 	MatchNamespaces []string `json:"matchNamespaces,omitempty"` // List of namespaces to match
-}
-type LabelSelector struct {
-	MatchLabels []string `json:"matchLabels,omitempty"` // List of labels to match
 }
 
 type MatchResources struct {

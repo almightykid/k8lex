@@ -1,5 +1,5 @@
 # VERSION defines the project version for the bundle.
-# Update this value when you upgrade the version of your project.
+# Update this value when you update the version of your project.
 # To re-generate a bundle for another specific version without changing the standard setup, you can:
 # - use the VERSION as arg of the bundle target (e.g make bundle VERSION=0.0.2)
 # - use environment variables to overwrite this value (e.g export VERSION=0.0.2)
@@ -136,18 +136,6 @@ build: manifests generate fmt vet ## Build manager binary.
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.
 	go run ./cmd/main.go
-
-.PHONY: run-info
-run: manifests generate fmt vet
-	go run ./cmd/main.go -zap-log-level=info
-
-.PHONY: run-error
-run: manifests generate fmt vet
-	go run ./cmd/main.go -zap-log-level=error
-
-.PHONY: run-debug
-run: manifests generate fmt vet
-	go run ./cmd/main.go -zap-log-level=debug
 
 # If you wish to build the manager image targeting other platforms you can use the --platform flag.
 # (i.e. docker build --platform linux/arm64). However, you must enable docker buildKit for it.

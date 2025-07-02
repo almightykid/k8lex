@@ -20,24 +20,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
-// NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
-
-// ClusterPolicyUpdaterSpec defines the desired state of ClusterPolicyUpdater
-type ClusterPolicyUpdaterSpec struct {
-	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
-
-	// Foo is an example field of ClusterPolicyUpdater. Edit clusterpolicyupdater_types.go to remove/update
-	Foo string `json:"foo,omitempty"`
-}
-
-// ClusterPolicyUpdaterStatus defines the observed state of ClusterPolicyUpdater
-type ClusterPolicyUpdaterStatus struct {
-	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
-}
-
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 
@@ -46,8 +28,7 @@ type ClusterPolicyUpdater struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	Spec   ClusterPolicyUpdaterSpec   `json:"spec,omitempty"`
-	Status ClusterPolicyUpdaterStatus `json:"status,omitempty"`
+	Spec ClusterPolicyUpdaterSpec `json:"spec,omitempty"`
 }
 
 // +kubebuilder:object:root=true
@@ -57,6 +38,34 @@ type ClusterPolicyUpdaterList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []ClusterPolicyUpdater `json:"items"`
+}
+
+type ClusterPolicyUpdaterSpec struct {
+	Description  string        `json:"description,omitempty"`
+	UpdaterRules []UpdaterRule `json:"updaterRules,omitempty"`
+}
+
+type UpdaterRule struct {
+	Name         string       `json:"name"`
+	Description  string       `json:"description,omitempty"`
+	Update       []Update     `json:"update,omitempty"`
+	Notification Notification `json:"notification,omitempty"`
+}
+
+type Update struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+type Notification struct {
+	Enabled     bool   `json:"enabled,omitempty"`
+	Message     string `json:"message,omitempty"`
+	NotifierRef Ref    `json:"notifierRef,omitempty"`
+}
+
+type Ref struct {
+	Name      string `json:"name,omitempty"`
+	Namespace string `json:"namespace,omitempty"`
 }
 
 func init() {

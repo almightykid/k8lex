@@ -6,8 +6,10 @@ import (
 	"reflect"
 	"strings"
 
-	clusterpolicyvalidatorv1alpha1 "github.com/almightykid/k8lex/api/clusterpolicyvalidator/v1alpha1"
 	"github.com/go-logr/logr"
+	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -19,27 +21,26 @@ import (
 // configured in the reconciler. It iterates through the WatchedResources configuration
 // and tries to retrieve the resource specified in the reconcile request.
 func (r *ClusterPolicyValidatorReconciler) findResource(ctx context.Context, req ctrl.Request, logger logr.Logger) (client.Object, schema.GroupVersionKind, error) {
-	// Iterate through all configured watched resource types
-	for _, config := range r.WatchedResources {
-		// Skip ClusterPolicyValidator resources to avoid self-validation loops
-		if config.GVK.Kind == "ClusterPolicyValidator" &&
-			config.GVK.Group == clusterpolicyvalidatorv1alpha1.GroupVersion.Group {
-			continue
-		}
+	resourceTypes := []struct {
+		obj client.Object
+		gvk schema.GroupVersionKind
+	}{
+		{&appsv1.Deployment{}, schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"}},
+		{&appsv1.StatefulSet{}, schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "StatefulSet"}},
+		{&appsv1.ReplicaSet{}, schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "ReplicaSet"}},
+		{&appsv1.DaemonSet{}, schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "DaemonSet"}},
+		{&batchv1.Job{}, schema.GroupVersionKind{Group: "batch", Version: "v1", Kind: "Job"}},
+		{&batchv1.CronJob{}, schema.GroupVersionKind{Group: "batch", Version: "v1", Kind: "CronJob"}},
+	}
 
-		// Create a deep copy of the resource template to avoid modifying the original
-		tempResource := config.Object.DeepCopyObject().(client.Object)
-		tempResource.GetObjectKind().SetGroupVersionKind(config.GVK)
-
-		// Attempt to retrieve the resource from the cluster
-		if err := r.Get(ctx, req.NamespacedName, tempResource); err == nil {
-			logger.V(2).Info("Found matching resource", "kind", config.GVK.Kind, "name", tempResource.GetName())
-			return tempResource, config.GVK, nil
+	for _, rt := range resourceTypes {
+		obj := rt.obj.DeepCopyObject().(client.Object)
+		err := r.Get(ctx, req.NamespacedName, obj)
+		if err == nil {
+			return obj, rt.gvk, nil
 		}
 	}
 
-	// Increment metrics counter for resources not found or not watched
-	errorTotal.WithLabelValues("resource_not_found_or_not_watched", "unknown").Inc()
 	return nil, schema.GroupVersionKind{}, nil
 }
 
@@ -122,44 +123,39 @@ func (r *ClusterPolicyValidatorReconciler) updateViolationAnnotations(
 	violations []ValidationResult,
 	logger logr.Logger,
 ) error {
-	// Get existing annotations or create new map if none exist
-	annotations := resource.GetAnnotations()
-	if annotations == nil {
-		annotations = make(map[string]string)
-	}
-
-	if len(violations) > 0 {
-		// Mark resource as having policy violations
-		annotations[PolicyViolationAnnotation] = "true"
-
-		// Build detailed violation information for each policy violation
-		var details []string
-		for _, v := range violations {
-			detail := fmt.Sprintf("Policy: %s, Rule: %s, Severity: %s, Message: %s",
-				v.PolicyName, v.RuleName, v.Severity, v.ErrorMessage)
-			details = append(details, detail)
+	maxRetries := 5
+	for i := 0; i < maxRetries; i++ {
+		annotations := resource.GetAnnotations()
+		if annotations == nil {
+			annotations = map[string]string{}
 		}
-		// Combine all violation details into a single annotation value
-		annotations[ViolationDetailsAnnotation] = strings.Join(details, "; ")
-	} else {
-		// No violations found - remove violation annotations to clean up the resource
-		delete(annotations, PolicyViolationAnnotation)
-		delete(annotations, ViolationDetailsAnnotation)
+		if len(violations) > 0 {
+			annotations[PolicyViolationAnnotation] = "true"
+			// Optionally, store details of the violation
+			annotations[ViolationDetailsAnnotation] = fmt.Sprintf("%v", violations)
+		} else {
+			delete(annotations, PolicyViolationAnnotation)
+			delete(annotations, ViolationDetailsAnnotation)
+			delete(annotations, "k8lex.io/clusterpolicyupdater")
+		}
+		resource.SetAnnotations(annotations)
+		if err := r.Update(ctx, resource); err != nil {
+			if apierrors.IsConflict(err) {
+				logger.Info("Conflict updating resource annotations, retrying", "attempt", i+1, "name", resource.GetName(), "namespace", resource.GetNamespace())
+				// Reload the latest version and retry
+				if errGet := r.Get(ctx, client.ObjectKey{Namespace: resource.GetNamespace(), Name: resource.GetName()}, resource); errGet != nil {
+					logger.Error(errGet, "Failed to reload resource after conflict", "name", resource.GetName(), "namespace", resource.GetNamespace())
+					return errGet
+				}
+				continue
+			}
+			logger.Error(err, "Failed to update resource annotations", "name", resource.GetName(), "namespace", resource.GetNamespace())
+			return err
+		}
+		logger.V(1).Info("Updated resource annotations", "name", resource.GetName(), "namespace", resource.GetNamespace())
+		return nil
 	}
-
-	// Apply the updated annotations to the resource
-	resource.SetAnnotations(annotations)
-
-	// Persist the annotation changes to the Kubernetes cluster
-	if err := r.Update(ctx, resource); err != nil {
-		logger.Error(err, "Failed to update resource annotations",
-			"name", resource.GetName(),
-			"namespace", resource.GetNamespace())
-		errorTotal.WithLabelValues("failed_update_resource_annotations", resource.GetKind()).Inc()
-		return err
-	}
-
-	return nil
+	return fmt.Errorf("Failed to update resource annotations after %d retries due to conflicts", maxRetries)
 }
 
 // clearViolationAnnotations removes policy violation annotations from a Kubernetes
@@ -173,32 +169,42 @@ func (r *ClusterPolicyValidatorReconciler) clearViolationAnnotations(
 	resource *unstructured.Unstructured,
 	logger logr.Logger,
 ) {
-	// Get current annotations, return early if none exist
 	annotations := resource.GetAnnotations()
 	if annotations == nil {
 		return
 	}
-
-	// Check if violation annotations are present before attempting removal
 	if _, exists := annotations[PolicyViolationAnnotation]; !exists {
 		return
 	}
-
-	// Remove both violation-related annotations
+	original := make(map[string]string, len(annotations))
+	for k, v := range annotations {
+		original[k] = v
+	}
 	delete(annotations, PolicyViolationAnnotation)
 	delete(annotations, ViolationDetailsAnnotation)
-	resource.SetAnnotations(annotations)
-
-	// Persist the annotation changes to the Kubernetes cluster
-	if err := r.Update(ctx, resource); err != nil {
-		logger.Error(err, "Failed to clear violation annotations",
-			"name", resource.GetName(),
-			"namespace", resource.GetNamespace())
-		errorTotal.WithLabelValues("failed_clear_violation_annotations", resource.GetKind()).Inc()
+	delete(annotations, "k8lex.io/clusterpolicyupdater")
+	changed := false
+	if len(annotations) != len(original) {
+		changed = true
 	} else {
-		logger.V(1).Info("Cleared violation annotations",
-			"name", resource.GetName(),
-			"namespace", resource.GetNamespace())
+		for k, v := range annotations {
+			if original[k] != v {
+				changed = true
+				break
+			}
+		}
+	}
+	if changed {
+		resource.SetAnnotations(annotations)
+		if err := r.Update(ctx, resource); err != nil {
+			logger.Error(err, "Failed to clear violation annotations",
+				"name", resource.GetName(),
+				"namespace", resource.GetNamespace())
+		} else {
+			logger.V(1).Info("Cleared violation annotations",
+				"name", resource.GetName(),
+				"namespace", resource.GetNamespace())
+		}
 	}
 }
 
@@ -253,8 +259,6 @@ func (r *ClusterPolicyValidatorReconciler) shouldBypassPolicies(resource client.
 		r.Log.Info("Emergency policy bypass detected",
 			"resource", resource.GetName(),
 			"namespace", resource.GetNamespace())
-		// Track emergency bypasses separately in metrics for audit purposes
-		policyBypassTotal.WithLabelValues("emergency", resource.GetObjectKind().GroupVersionKind().Kind).Inc()
 		return true
 	}
 
@@ -263,8 +267,6 @@ func (r *ClusterPolicyValidatorReconciler) shouldBypassPolicies(resource client.
 		r.Log.Info("Policy bypass detected",
 			"resource", resource.GetName(),
 			"namespace", resource.GetNamespace())
-		// Track regular bypasses in metrics
-		policyBypassTotal.WithLabelValues("regular", resource.GetObjectKind().GroupVersionKind().Kind).Inc()
 		return true
 	}
 

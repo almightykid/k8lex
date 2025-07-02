@@ -5,57 +5,18 @@ metadata:
   name: manager-role
 rules:
 - apiGroups:
-  - clusterpolicynotifier.k8lex.io
+  - apps
   resources:
-  - clusterpolicynotifiers
+  - daemonsets
+  - deployments
+  - replicasets
+  - statefulsets
   verbs:
-  - create
-  - delete
   - get
   - list
   - patch
   - update
   - watch
-- apiGroups:
-  - clusterpolicynotifier.k8lex.io
-  resources:
-  - clusterpolicynotifiers/finalizers
-  verbs:
-  - update
-- apiGroups:
-  - clusterpolicynotifier.k8lex.io
-  resources:
-  - clusterpolicynotifiers/status
-  verbs:
-  - get
-  - patch
-  - update
-- apiGroups:
-  - clusterpolicyset.k8lex.io
-  resources:
-  - clusterpolicysets
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - clusterpolicyset.k8lex.io
-  resources:
-  - clusterpolicysets/finalizers
-  verbs:
-  - update
-- apiGroups:
-  - clusterpolicyset.k8lex.io
-  resources:
-  - clusterpolicysets/status
-  verbs:
-  - get
-  - patch
-  - update
 - apiGroups:
   - clusterpolicyupdater.k8lex.io
   resources:
@@ -78,6 +39,42 @@ rules:
   - clusterpolicyupdater.k8lex.io
   resources:
   - clusterpolicyupdaters/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - policies.example.com
+  resources:
+  - clusterpolicynotifiers
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - policies.example.com
+  resources:
+  - clusterpolicynotifiers/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - policies.example.com
+  resources:
+  - clusterpolicynotifiers/status
   verbs:
   - get
   - patch

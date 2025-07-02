@@ -27,7 +27,7 @@ resources:
   controller: true
   domain: k8lex.io
   group: clusterpolicyupdater
-  kind: ClusterPolicyUpdater
+  kind: clusterpolicyupdater
   path: github.com/almightykid/k8lex/api/clusterpolicyupdater/v1alpha1
   version: v1alpha1
 - api:

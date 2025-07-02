@@ -15,76 +15,70 @@ import (
 // This method aggregates namespace inclusion and exclusion rules from all ClusterPolicyValidator policies
 // to create a unified filtering state. It implements retry logic to handle transient API failures gracefully
 func (r *ClusterPolicyValidatorReconciler) UpdateNamespaceFilterState(ctx context.Context) error {
-	return r.retryWithBackoff(ctx, func() error {
-		// Acquire exclusive lock to ensure atomic state updates during concurrent operations
-		r.namespaceFilterMu.Lock()
-		defer r.namespaceFilterMu.Unlock()
+	// Acquire exclusive lock to ensure atomic state updates during concurrent operations
+	r.namespaceFilterMu.Lock()
+	defer r.namespaceFilterMu.Unlock()
 
-		r.Log.V(2).Info("Starting namespace filter state update from all policies")
+	r.Log.V(2).Info("Starting namespace filter state update from all policies")
 
-		// Create fresh state to replace current state atomically, preventing partial updates
-		newState := &NamespaceFilterState{
-			IncludedNamespaces: make(map[string]struct{}),
-			ExcludedNamespaces: make(map[string]struct{}),
-			LastUpdated:        time.Now(),
-		}
+	// Create fresh state to replace current state atomically, preventing partial updates
+	newState := &NamespaceFilterState{
+		IncludedNamespaces: make(map[string]struct{}),
+		ExcludedNamespaces: make(map[string]struct{}),
+		LastUpdated:        time.Now(),
+	}
 
-		// Fetch all current ClusterPolicyValidator policies from the Kubernetes API
-		var allPolicies clusterpolicyvalidatorv1alpha1.ClusterPolicyValidatorList
-		if err := r.List(ctx, &allPolicies); err != nil {
-			r.Log.Error(err, "Failed to list ClusterPolicyValidators during namespace filter update")
-			return err
-		}
+	// Fetch all current ClusterPolicyValidator policies from the Kubernetes API
+	var allPolicies clusterpolicyvalidatorv1alpha1.ClusterPolicyValidatorList
+	if err := r.List(ctx, &allPolicies); err != nil {
+		r.Log.Error(err, "Failed to list ClusterPolicyValidators during namespace filter update")
+		return err
+	}
 
-		r.Log.Info("Processing namespace rules from all policies",
-			"total_policies", len(allPolicies.Items),
-			"action", "aggregating_namespace_rules")
+	// Aggregate namespace rules from each policy to build comprehensive filter state
+	for _, policy := range allPolicies.Items {
+		r.Log.Info("Processing namespace filtering for policy",
+			"policy_name", policy.Name,
+			"policy_namespace", policy.Namespace,
+			"policy_generation", policy.Generation,
+			"include_namespaces", len(policy.Spec.Namespaces.Include),
+			"exclude_namespaces", len(policy.Spec.Namespaces.Exclude))
 
-		// Aggregate namespace rules from each policy to build comprehensive filter state
-		for _, policy := range allPolicies.Items {
-			r.Log.V(2).Info("Processing namespace rules from individual policy",
-				"policy_name", policy.Name,
-				"include_namespaces", len(policy.Spec.Namespaces.Include),
-				"exclude_namespaces", len(policy.Spec.Namespaces.Exclude),
-				"policy_generation", policy.Generation)
-
-			// Process namespace inclusion rules - these define allowed namespaces
-			if len(policy.Spec.Namespaces.Include) > 0 {
-				newState.HasIncludeRules = true
-				for _, ns := range policy.Spec.Namespaces.Include {
-					newState.IncludedNamespaces[ns] = struct{}{}
-					r.Log.V(3).Info("Added namespace to inclusion list",
-						"namespace", ns,
-						"policy", policy.Name,
-						"rule_type", "include")
-				}
-			}
-
-			// Process namespace exclusion rules - these define forbidden namespaces
-			if len(policy.Spec.Namespaces.Exclude) > 0 {
-				newState.HasExcludeRules = true
-				for _, ns := range policy.Spec.Namespaces.Exclude {
-					newState.ExcludedNamespaces[ns] = struct{}{}
-					r.Log.V(3).Info("Added namespace to exclusion list",
-						"namespace", ns,
-						"policy", policy.Name,
-						"rule_type", "exclude")
-				}
+		// Process namespace inclusion rules - these define allowed namespaces
+		if len(policy.Spec.Namespaces.Include) > 0 {
+			newState.HasIncludeRules = true
+			for _, ns := range policy.Spec.Namespaces.Include {
+				newState.IncludedNamespaces[ns] = struct{}{}
+				r.Log.V(3).Info("Added namespace to inclusion list",
+					"namespace", ns,
+					"policy", policy.Name,
+					"rule_type", "include")
 			}
 		}
 
-		// Atomically replace the current namespace filter state to prevent inconsistencies
-		r.namespaceFilter = newState
+		// Process namespace exclusion rules - these define forbidden namespaces
+		if len(policy.Spec.Namespaces.Exclude) > 0 {
+			newState.HasExcludeRules = true
+			for _, ns := range policy.Spec.Namespaces.Exclude {
+				newState.ExcludedNamespaces[ns] = struct{}{}
+				r.Log.V(3).Info("Added namespace to exclusion list",
+					"namespace", ns,
+					"policy", policy.Name,
+					"rule_type", "exclude")
+			}
+		}
+	}
 
-		r.Log.Info("Namespace filter state updated successfully",
-			"included_namespaces", len(newState.IncludedNamespaces),
-			"excluded_namespaces", len(newState.ExcludedNamespaces),
-			"has_include_rules", newState.HasIncludeRules,
-			"has_exclude_rules", newState.HasExcludeRules,
-			"update_timestamp", newState.LastUpdated)
+	// Atomically replace the current namespace filter state to prevent inconsistencies
+	r.namespaceFilter = newState
 
-		return nil
-	}, "api-update-namespace-filter")
+	r.Log.Info("Namespace filter state updated successfully",
+		"included_namespaces", len(newState.IncludedNamespaces),
+		"excluded_namespaces", len(newState.ExcludedNamespaces),
+		"has_include_rules", newState.HasIncludeRules,
+		"has_exclude_rules", newState.HasExcludeRules)
+
+	return nil
 }
 
 // ensureNamespaceFilterInitialized performs lazy initialization and cache-aware refresh of namespace filter state
@@ -140,7 +134,6 @@ func (r *ClusterPolicyValidatorReconciler) isNamespaceAllowedByPredicate(ns stri
 		"total_excluded", len(filter.ExcludedNamespaces),
 		"last_updated", filter.LastUpdated)
 
-	// SECURITY-CRITICAL: Exclude rules take absolute precedence over include rules
 	// If a namespace is explicitly excluded, it's ALWAYS blocked regardless of include rules
 	// This ensures that security policies cannot be bypassed through conflicting rules
 	if filter.HasExcludeRules {
@@ -149,7 +142,6 @@ func (r *ClusterPolicyValidatorReconciler) isNamespaceAllowedByPredicate(ns stri
 				"namespace", ns,
 				"rule_type", "exclude",
 				"precedence", "absolute")
-			namespaceFilteredEvents.WithLabelValues(ns, "excluded", "exclude_rule_precedence").Inc()
 			return false
 		}
 	}
@@ -163,11 +155,10 @@ func (r *ClusterPolicyValidatorReconciler) isNamespaceAllowedByPredicate(ns stri
 				"status", "allowed")
 			return true
 		} else {
-			logger.V(1).Info("Namespace not in inclusion list - blocked by default",
+			logger.V(1).Info("Namespace not in inclusion list.",
 				"namespace", ns,
 				"rule_type", "include_missing",
 				"status", "blocked")
-			namespaceFilteredEvents.WithLabelValues(ns, "filtered", "not_in_include_list").Inc()
 			return false
 		}
 	}

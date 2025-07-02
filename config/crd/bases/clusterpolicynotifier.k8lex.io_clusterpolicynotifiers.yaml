@@ -14,7 +14,20 @@ spec:
     singular: clusterpolicynotifier
   scope: Namespaced
   versions:
-  - name: v1alpha1
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.notificationsSent
+      name: Notifications Sent
+      type: integer
+    - jsonPath: .status.lastSentNotification
+      name: Last Sent
+      type: date
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
     schema:
       openAPIV3Schema:
         description: ClusterPolicyNotifier is the Schema for the clusterpolicynotifiers
@@ -40,57 +53,73 @@ spec:
           spec:
             description: ClusterPolicyNotifierSpec defines the desired state of ClusterPolicyNotifier
             properties:
-              email:
-                properties:
-                  authPassword:
-                    type: string
-                  authUser:
-                    type: string
-                  fromEmail:
-                    type: string
-                  smtpPort:
-                    type: integer
-                  smtpServer:
-                    type: string
-                  toEmail:
-                    items:
-                      type: string
-                    type: array
-                required:
-                - authPassword
-                - authUser
-                - fromEmail
-                - smtpPort
-                - smtpServer
-                - toEmail
-                type: object
-              slack:
-                properties:
-                  channel:
-                    type: string
-                  webhookUrl:
-                    type: string
-                required:
-                - channel
-                - webhookUrl
-                type: object
-              teams:
-                properties:
-                  webhookUrl:
-                    type: string
-                required:
-                - webhookUrl
-                type: object
+              slackWebhookUrl:
+                description: Slack webhook URL for sending notifications
+                type: string
+            required:
+            - slackWebhookUrl
             type: object
           status:
             description: ClusterPolicyNotifierStatus defines the observed state of
               ClusterPolicyNotifier
             properties:
+              conditions:
+                description: Human-readable conditions about the notifier
+                items:
+                  description: NotifierCondition represents a condition of the notifier
+                  properties:
+                    lastTransitionTime:
+                      description: Last time the condition transitioned from one status
+                        to another
+                      format: date-time
+                      type: string
+                    lastUpdateTime:
+                      description: Last time the condition was updated
+                      format: date-time
+                      type: string
+                    message:
+                      description: Human-readable message indicating details about
+                        the transition
+                      type: string
+                    reason:
+                      description: Reason for the condition's last transition
+                      type: string
+                    status:
+                      description: Status of the condition
+                      type: string
+                    type:
+                      description: Type of the condition
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - lastUpdateTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              lastError:
+                description: Last error message if notification failed
+                type: string
               lastSentNotification:
-                description: |-
-                  INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
-                  Important: Run "make" to regenerate code after modifying this file
+                description: Timestamp of the last sent notification
                 format: date-time
+                type: string
+              notificationsFailed:
+                description: Number of failed notification attempts
+                format: int64
+                type: integer
+              notificationsSent:
+                description: Total number of notifications sent
+                format: int64
+                type: integer
+              observedGeneration:
+                description: Observed generation (to prevent duplicate processing)
+                format: int64
+                type: integer
+              phase:
+                description: Current status of the notifier
                 type: string
             type: object
         type: object

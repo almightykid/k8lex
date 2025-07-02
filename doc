@@ -11,7 +11,7 @@ Pendiente para manana
     - Define las reglas de validación que se aplicarán a los recursos del clúster.
     - Similar a Kyverno, pero con mejoras en eficiencia y caché.
     - En caso de violar la politica se anade una anotacion:     policy/<policy-violated>: "true"
-2. ClusterPolicyUpdater
+2. clusterpolicyupdater
     - Define acciones que el operador tomará si una regla no se cumple.
     - No solo valida, sino que modifica recursos en base al contexto (ej. límites más restrictivos en producción).
 3. ClusterPolicySet
@@ -43,7 +43,7 @@ Implementar la lógica de validación: El operador debe inspeccionar los recurso
 
 Manejo de errores: Cuando se detecte una infracción, el operador debería registrar este problema, generar un informe y posiblemente interactuar con el notificador para enviar alertas.
 
-3. Desarrollar el Bloque de Actualización (ClusterPolicyUpdater)
+3. Desarrollar el Bloque de Actualización (clusterpolicyupdater)
 Una vez que tengas el validador funcionando, puedes empezar a implementar el bloque de actualización, que actuará cuando se detecten violaciones de política.
 
 Definir las acciones a tomar cuando no se cumplan las políticas: Por ejemplo, actualizar una imagen de contenedor, ajustar límites de recursos o reconfigurar algún parámetro en el recurso.
@@ -85,12 +85,12 @@ No olvides documentar bien tu operador, incluyendo cómo configurarlo, cómo se 
 --------------------------
 Cluster Policy Set
 
-¡Te entiendo perfectamente! Estás trabajando en un operador personalizado utilizando Operator SDK similar a Kyverno, y ya has definido varios recursos clave como ClusterPolicyValidator, ClusterPolicyUpdater, Notifier, y PolicyReport. Sin embargo, te sientes un poco dudoso acerca del recurso ClusterPolicySet y su utilidad dentro de esta arquitectura.
+¡Te entiendo perfectamente! Estás trabajando en un operador personalizado utilizando Operator SDK similar a Kyverno, y ya has definido varios recursos clave como ClusterPolicyValidator, clusterpolicyupdater, Notifier, y PolicyReport. Sin embargo, te sientes un poco dudoso acerca del recurso ClusterPolicySet y su utilidad dentro de esta arquitectura.
 
 Voy a intentar aclarar la utilidad de ClusterPolicySet en este contexto.
 
 ¿Qué es ClusterPolicySet?
-Un ClusterPolicySet en tu operador podría actuar como una entidad que agrupa múltiples políticas relacionadas (tanto ClusterPolicyValidator como ClusterPolicyUpdater) bajo una única definición o conjunto. En lugar de gestionar las políticas de forma individual, este recurso permite organizar y manejar varias políticas relacionadas de forma más eficiente.
+Un ClusterPolicySet en tu operador podría actuar como una entidad que agrupa múltiples políticas relacionadas (tanto ClusterPolicyValidator como clusterpolicyupdater) bajo una única definición o conjunto. En lugar de gestionar las políticas de forma individual, este recurso permite organizar y manejar varias políticas relacionadas de forma más eficiente.
 
 ¿Por qué podría ser útil un ClusterPolicySet?
 Aquí te dejo algunos puntos que podrían justificar la existencia y utilidad de este recurso dentro de tu operador:

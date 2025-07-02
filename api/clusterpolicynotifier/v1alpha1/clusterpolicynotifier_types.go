@@ -18,76 +18,118 @@ package v1alpha1
 
 import (
 	"errors"
-	"regexp"
+	"strings"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
-// NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
-
 // ClusterPolicyNotifierSpec defines the desired state of ClusterPolicyNotifier
 type ClusterPolicyNotifierSpec struct {
-	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
-
-	Slack *SlackConfig `json:"slack,omitempty"`
-	Teams *TeamsConfig `json:"teams,omitempty"`
-	Email *EmailConfig `json:"email,omitempty"`
-}
-
-type SlackConfig struct {
-	WebhookURL string `json:"webhookUrl"` // Webhook de Slack para enviar mensajes
-	Channel    string `json:"channel"`    // Canal de Slack donde se enviarán las alertas
-}
-
-type TeamsConfig struct {
-	WebhookURL string `json:"webhookUrl"` // Webhook de Teams
-}
-
-type EmailConfig struct {
-	SMTPServer   string   `json:"smtpServer"`
-	SMTPPort     int      `json:"smtpPort"`
-	FromEmail    string   `json:"fromEmail"`
-	Recipients   []string `json:"toEmail"`
-	AuthUser     string   `json:"authUser"`
-	AuthPassword string   `json:"authPassword"`
-}
-
-func ValidateEmail(email string) bool {
-	// Basic regular expression to validate emails.
-	// This is a simple validation; you can use more robust libraries if needed.
-	regex := `^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`
-	re := regexp.MustCompile(regex)
-	return re.MatchString(email)
-}
-
-func (c *ClusterPolicyNotifier) Validate() error {
-	if c.Spec.Email != nil {
-		// Validate FromEmail
-		if !ValidateEmail(c.Spec.Email.FromEmail) {
-			return errors.New("invalid FromEmail address")
-		}
-
-		// Validate each recipient email
-		for _, recipient := range c.Spec.Email.Recipients {
-			if !ValidateEmail(recipient) {
-				return errors.New("invalid recipient email: " + recipient)
-			}
-		}
-	}
-	return nil
+	// Slack webhook URL for sending notifications
+	// +kubebuilder:validation:Required
+	SlackWebhookUrl string `json:"slackWebhookUrl"`
 }
 
 // ClusterPolicyNotifierStatus defines the observed state of ClusterPolicyNotifier
 type ClusterPolicyNotifierStatus struct {
-	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
-	LastSentNotification metav1.Time `json:"lastSentNotification,omitempty"`
+	// Observed generation (to prevent duplicate processing)
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+	// Timestamp of the last sent notification
+	// +optional
+	LastSentNotification *metav1.Time `json:"lastSentNotification,omitempty"`
+
+	// Total number of notifications sent
+	// +optional
+	NotificationsSent int64 `json:"notificationsSent,omitempty"`
+
+	// Number of failed notification attempts
+	// +optional
+	NotificationsFailed int64 `json:"notificationsFailed,omitempty"`
+
+	// Last error message if notification failed
+	// +optional
+	LastError string `json:"lastError,omitempty"`
+
+	// Current status of the notifier
+	// +optional
+	Phase NotifierPhase `json:"phase,omitempty"`
+
+	// Human-readable conditions about the notifier
+	// +optional
+	Conditions []NotifierCondition `json:"conditions,omitempty"`
+}
+
+// NotifierPhase represents the current phase of the notifier
+type NotifierPhase string
+
+const (
+	// NotifierPhaseReady indicates the notifier is ready to send notifications
+	NotifierPhaseReady NotifierPhase = "Ready"
+
+	// NotifierPhaseError indicates the notifier has configuration errors
+	NotifierPhaseError NotifierPhase = "Error"
+)
+
+// NotifierCondition represents a condition of the notifier
+type NotifierCondition struct {
+	// Type of the condition
+	Type NotifierConditionType `json:"type"`
+
+	// Status of the condition
+	Status metav1.ConditionStatus `json:"status"`
+
+	// Last time the condition was updated
+	LastUpdateTime metav1.Time `json:"lastUpdateTime"`
+
+	// Last time the condition transitioned from one status to another
+	LastTransitionTime metav1.Time `json:"lastTransitionTime"`
+
+	// Reason for the condition's last transition
+	Reason string `json:"reason"`
+
+	// Human-readable message indicating details about the transition
+	Message string `json:"message"`
+}
+
+// NotifierConditionType represents the type of notifier condition
+type NotifierConditionType string
+
+const (
+	// NotifierConditionReady indicates whether the notifier is ready
+	NotifierConditionReady NotifierConditionType = "Ready"
+
+	// NotifierConditionConfigured indicates whether the notifier is properly configured
+	NotifierConditionConfigured NotifierConditionType = "Configured"
+)
+
+// ValidateWebhookURL validates a Slack webhook URL
+func ValidateWebhookURL(url string) bool {
+	if url == "" {
+		return false
+	}
+	// Slack webhook URLs must start with https://hooks.slack.com/
+	return strings.HasPrefix(url, "https://hooks.slack.com/")
+}
+
+// Validate validates the ClusterPolicyNotifier configuration
+func (c *ClusterPolicyNotifier) Validate() error {
+	// Validate Slack webhook URL
+
+	if !ValidateWebhookURL(c.Spec.SlackWebhookUrl) {
+		return errors.New("invalid Slack webhook URL: must start with https://hooks.slack.com/")
+	}
+
+	return nil
 }
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:printcolumn:name="Phase",type="string",JSONPath=".status.phase"
+// +kubebuilder:printcolumn:name="Notifications Sent",type="integer",JSONPath=".status.notificationsSent"
+// +kubebuilder:printcolumn:name="Last Sent",type="date",JSONPath=".status.lastSentNotification"
+// +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 
 // ClusterPolicyNotifier is the Schema for the clusterpolicynotifiers API
 type ClusterPolicyNotifier struct {
