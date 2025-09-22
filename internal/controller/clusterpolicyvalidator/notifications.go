@@ -8,9 +8,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
-const (
-	defaultNotifier = "slack-notifier"
-)
+// getDefaultNotifier returns the configured default notifier or fallback
+func (r *ClusterPolicyValidatorReconciler) getDefaultNotifier() string {
+	if r.Config != nil && r.Config.DefaultNotifierName != "" {
+		return r.Config.DefaultNotifierName
+	}
+	// Fallback to default value
+	return "slack-notifier"
+}
 
 // SendPolicyViolationNotification sends a notification when a resource violates a policy rule.
 // It includes details about the resource, the violated rule, and the reason for the violation.
@@ -40,7 +45,7 @@ func (r *ClusterPolicyValidatorReconciler) SendPolicyViolationNotification(ctx c
 		"rule", ruleName,
 		"message", message)
 
-	if err := r.NotifierController.SendMessage(ctx, defaultNotifier, message); err != nil {
+	if err := r.NotifierController.SendMessage(ctx, r.getDefaultNotifier(), message); err != nil {
 		logger.Error(err, "Failed to send policy violation notification")
 		return fmt.Errorf("failed to send notification: %w", err)
 	}
@@ -76,19 +81,19 @@ func (r *ClusterPolicyValidatorReconciler) NotifyResourceBlocked(ctx context.Con
 	message := fmt.Sprintf("Blocking resource %s due to violation of rule %s\n\n📋 Reason: %s\n🕐 Timestamp: %s",
 		fullResourceName, ruleName, reason, time.Now().Format(time.RFC3339))
 
-	return r.SendCustomNotification(ctx, defaultNotifier, message)
+	return r.SendCustomNotification(ctx, r.getDefaultNotifier(), message)
 }
 
 // NotifyValidationSuccess sends a notification for successful validation of a resource.
 // This is typically used to confirm that a resource has passed all policy checks.
 func (r *ClusterPolicyValidatorReconciler) NotifyValidationSuccess(ctx context.Context, message string) error {
 	successMessage := fmt.Sprintf("✅ %s", message)
-	return r.SendCustomNotification(ctx, defaultNotifier, successMessage)
+	return r.SendCustomNotification(ctx, r.getDefaultNotifier(), successMessage)
 }
 
 // NotifyWarning sends a warning notification.
 // This is used for non-blocking issues that should be brought to attention.
 func (r *ClusterPolicyValidatorReconciler) NotifyWarning(ctx context.Context, message string) error {
 	warningMessage := fmt.Sprintf("⚠️ %s", message)
-	return r.SendCustomNotification(ctx, defaultNotifier, warningMessage)
+	return r.SendCustomNotification(ctx, r.getDefaultNotifier(), warningMessage)
 }

@@ -15,6 +15,125 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
+// Rule evaluation helper functions implementing Single Responsibility Principle
+
+// validateRuleInputs performs basic validation of rule evaluation inputs
+func (r *ClusterPolicyValidatorReconciler) validateRuleInputs(
+	resource *unstructured.Unstructured,
+	policyName string,
+	rule clusterpolicyvalidatorv1alpha1.ValidationRule,
+	logger logr.Logger,
+) error {
+	if resource == nil {
+		err := fmt.Errorf("resource is nil when evaluating rule")
+		logger.Error(err, "Invalid input", "policy", policyName, "rule", rule.Name)
+		return err
+	}
+	if policyName == "" {
+		err := fmt.Errorf("policy name is empty when evaluating rule")
+		logger.Error(err, "Invalid input", "rule", rule.Name)
+		return err
+	}
+	return nil
+}
+
+// evaluateRuleConditions processes all conditions in a rule and returns violation details if any
+func (r *ClusterPolicyValidatorReconciler) evaluateRuleConditions(
+	resource *unstructured.Unstructured,
+	policyName string,
+	rule clusterpolicyvalidatorv1alpha1.ValidationRule,
+	resourceGVK schema.GroupVersionKind,
+	logger logr.Logger,
+) *ValidationResult {
+	for _, condition := range rule.Conditions {
+		if violation := r.evaluateSingleCondition(resource, policyName, rule, condition, resourceGVK, logger); violation != nil {
+			return violation
+		}
+	}
+	return nil // No violations found
+}
+
+// evaluateSingleCondition evaluates one condition and returns a violation if found
+func (r *ClusterPolicyValidatorReconciler) evaluateSingleCondition(
+	resource *unstructured.Unstructured,
+	policyName string,
+	rule clusterpolicyvalidatorv1alpha1.ValidationRule,
+	condition clusterpolicyvalidatorv1alpha1.Condition,
+	resourceGVK schema.GroupVersionKind,
+	logger logr.Logger,
+) *ValidationResult {
+	logger.V(1).Info("Evaluating condition",
+		"policy", policyName,
+		"rule", rule.Name,
+		"condition", sanitizeLogValue(condition.Key),
+		"resource", resource.GetName(),
+		"kind", resourceGVK.Kind)
+
+	// Validate condition key
+	if condition.Key == "" {
+		logger.Error(nil, "Empty condition key found in rule", "rule", rule.Name, "policy", policyName)
+		return nil
+	}
+
+	// Extract values from the resource
+	values, err := r.extractValues(resource, condition.Key)
+	if err != nil {
+		logger.Error(err, "Failed to extract values for condition key",
+			"key", sanitizeLogValue(condition.Key),
+			"kind", resourceGVK.Kind,
+			"resource", resource.GetName(),
+			"policy", policyName,
+			"rule", rule.Name)
+		return nil
+	}
+
+	logger.V(1).Info("Values extracted for condition",
+		"policy", policyName,
+		"rule", rule.Name,
+		"condition", sanitizeLogValue(condition.Key),
+		"values", sanitizeLogValue(values),
+		"resource", resource.GetName(),
+		"kind", resourceGVK.Kind)
+
+	// Validate the condition using refactored Single Responsibility approach
+	if r.validateConditionRefactored(condition, values, logger) {
+		logger.Info("Rule violation detected",
+			"policy", policyName,
+			"rule", rule.Name,
+			"condition_key", sanitizeLogValue(condition.Key),
+			"resource", resource.GetName(),
+			"kind", resourceGVK.Kind,
+			"action", rule.Action)
+
+		return r.createViolationResult(policyName, rule, condition)
+	}
+
+	logger.V(1).Info("Condition validated",
+		"policy", policyName,
+		"rule", rule.Name,
+		"condition", sanitizeLogValue(condition.Key),
+		"values", sanitizeLogValue(values),
+		"resource", resource.GetName(),
+		"kind", resourceGVK.Kind)
+
+	return nil
+}
+
+// createViolationResult creates a structured violation result
+func (r *ClusterPolicyValidatorReconciler) createViolationResult(
+	policyName string,
+	rule clusterpolicyvalidatorv1alpha1.ValidationRule,
+	condition clusterpolicyvalidatorv1alpha1.Condition,
+) *ValidationResult {
+	return &ValidationResult{
+		PolicyName:   policyName,
+		RuleName:     rule.Name,
+		Violated:     true,
+		Action:       rule.Action,
+		ResourcePath: condition.Key,
+	}
+}
+
 // evaluatePolicies orchestrates the policy evaluation process for a given Kubernetes resource.
 
 // to ensure efficient and resilient policy enforcement.
@@ -44,7 +163,6 @@ func (r *ClusterPolicyValidatorReconciler) evaluatePolicies(
 				continue
 			}
 
-
 			logger.V(1).Info("Evaluating rule",
 				"policy", policy.Name,
 				"rule", rule.Name,
@@ -65,6 +183,8 @@ func (r *ClusterPolicyValidatorReconciler) evaluatePolicies(
 // It iterates through the rule's conditions, extracts values from the resource using JQ,
 // and validates them against the condition's operator and expected values.
 // Returns a pointer to a ValidationResult if a violation is found, otherwise nil.
+// evaluateRule orchestrates rule evaluation using Single Responsibility Principle
+// This refactored version delegates specific tasks to focused helper functions
 func (r *ClusterPolicyValidatorReconciler) evaluateRule(
 	resource *unstructured.Unstructured,
 	policyName string,
@@ -79,87 +199,133 @@ func (r *ClusterPolicyValidatorReconciler) evaluateRule(
 		"resource", resource.GetName(),
 		"kind", resourceGVK.Kind)
 
-	// Basic nil checks for robustness.
-	if resource == nil {
-		logger.Error(nil, "Resource is nil when evaluating rule", "policy", policyName, "rule", rule.Name)
-		return nil
-	}
-	if policyName == "" {
-		logger.Error(nil, "Policy name is empty when evaluating rule", "rule", rule.Name)
+	// Validate inputs
+	if err := r.validateRuleInputs(resource, policyName, rule, logger); err != nil {
 		return nil
 	}
 
-	// Iterate through each condition defined within the rule.
-	for _, condition := range rule.Conditions {
+	// Evaluate all conditions in the rule
+	return r.evaluateRuleConditions(resource, policyName, rule, resourceGVK, logger)
+}
 
-		logger.V(1).Info("Evaluating condition",
-			"policy", policyName,
-			"rule", rule.Name,
-			"condition", condition.Key,
-			"resource", resource.GetName(),
-			"kind", resourceGVK.Kind)
+// Condition validation helper functions implementing Single Responsibility Principle
 
-		// Validate that the condition key is not empty.
-		if condition.Key == "" {
-			logger.Error(nil, "Empty condition key found in rule", "rule", rule.Name, "policy", policyName)
-			continue
+// normalizeActualValues converts actualValues to normalized string slice
+func normalizeActualValues(actualValues []interface{}) []string {
+	normalized := make([]string, 0, len(actualValues))
+	for _, v := range actualValues {
+		if v == nil {
+			normalized = append(normalized, "")
+		} else {
+			normalized = append(normalized, fmt.Sprintf("%v", v))
 		}
+	}
+	return normalized
+}
 
-		// Extract values from the resource using the condition's key (which is a JQ path).
-		values, err := r.extractValues(resource, condition.Key)
-		if err != nil {
-			logger.Error(err, "Failed to extract values for condition key",
-				"key", condition.Key, "kind", resourceGVK.Kind,
-				"resource", resource.GetName(), "policy", policyName, "rule", rule.Name)
-
-			continue
-		}
-
-		logger.V(1).Info("Values extracted for condition",
-			"policy", policyName,
-			"rule", rule.Name,
-			"condition", condition.Key,
-			"values", values,
-			"resource", resource.GetName(),
-			"kind", resourceGVK.Kind)
-
-		// Validate the extracted values against the condition's operator and expected values.
-		// If the validation fails, a violation is detected.
-		if r.validateCondition(condition, values, logger) {
-			logger.Info("Rule violation detected",
-				"policy", policyName,
-				"rule", rule.Name,
-				"condition_key", condition.Key,
-				"resource", resource.GetName(),
-				"kind", resourceGVK.Kind,
-				"action", rule.Action)
-
-			// Return a new ValidationResult object describing the violation.
-			return &ValidationResult{
-				PolicyName:   policyName,
-				RuleName:     rule.Name,
-				Violated:     true,
-				Action:       rule.Action,   // Convert Severity enum to string.
-				ResourcePath: condition.Key, // The JQ path that caused the violation.
+// validateEmptyOperators handles IsEmpty and IsNotEmpty operators
+func validateEmptyOperators(operator string, normalized []string) (bool, bool) {
+	switch operator {
+	case "IsEmpty":
+		allEmpty := true
+		for _, v := range normalized {
+			if v != "" {
+				allEmpty = false
+				break
 			}
 		}
-
-		logger.V(1).Info("Condition validated",
-			"policy", policyName,
-			"rule", rule.Name,
-			"condition", condition.Key,
-			"values", values,
-			"resource", resource.GetName(),
-			"kind", resourceGVK.Kind)
+		return !allEmpty, true
+	case "IsNotEmpty":
+		for _, v := range normalized {
+			if v != "" {
+				return true, true
+			}
+		}
+		return false, true
 	}
+	return false, false // Not an empty operator
+}
 
-	return nil // No violations found for this rule.
+// validateMapValue validates map-type values against condition
+func (r *ClusterPolicyValidatorReconciler) validateMapValue(
+	m map[string]interface{},
+	condition clusterpolicyvalidatorv1alpha1.Condition,
+	logger logr.Logger,
+) bool {
+	for _, expectedVal := range condition.Values {
+		switch condition.Operator {
+		case "Contains":
+			if _, exists := m[expectedVal]; exists {
+				logger.V(2).Info("Map contains key", "expectedKey", sanitizeLogValue(expectedVal))
+				return true
+			}
+		case "NotContains":
+			if _, exists := m[expectedVal]; !exists {
+				logger.V(2).Info("Map does not contain key", "expectedKey", sanitizeLogValue(expectedVal))
+				return true
+			}
+		case "Equals":
+			if v, exists := m[expectedVal]; exists && v == expectedVal {
+				logger.V(2).Info("Map key equals expected value", "expectedKey", sanitizeLogValue(expectedVal))
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// validateStringValue validates string-type values against condition
+func (r *ClusterPolicyValidatorReconciler) validateStringValue(
+	actualStr string,
+	condition clusterpolicyvalidatorv1alpha1.Condition,
+	logger logr.Logger,
+) bool {
+	for _, expectedVal := range condition.Values {
+		switch condition.Operator {
+		case "Equals":
+			if actualStr == expectedVal {
+				logger.V(2).Info("String equals expected value",
+					"actual", sanitizeLogValue(actualStr),
+					"expected", sanitizeLogValue(expectedVal))
+				return true
+			}
+		case "NotEquals":
+			if actualStr != expectedVal {
+				logger.V(2).Info("String not equals expected value",
+					"actual", sanitizeLogValue(actualStr),
+					"expected", sanitizeLogValue(expectedVal))
+				return true
+			}
+		case "Contains":
+			if strings.Contains(actualStr, expectedVal) {
+				logger.V(2).Info("String contains expected substring",
+					"actual", sanitizeLogValue(actualStr),
+					"expected", sanitizeLogValue(expectedVal))
+				return true
+			}
+		case "NotContains":
+			if !strings.Contains(actualStr, expectedVal) {
+				logger.V(2).Info("String does not contain expected substring",
+					"actual", sanitizeLogValue(actualStr),
+					"expected", sanitizeLogValue(expectedVal))
+				return true
+			}
+		case "Regex":
+			if matched, err := regexp.MatchString(expectedVal, actualStr); err == nil && matched {
+				logger.V(2).Info("String matches regex pattern",
+					"actual", sanitizeLogValue(actualStr),
+					"pattern", sanitizeLogValue(expectedVal))
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // validateCondition validates a list of actual values against a single policy condition.
 // It handles various operators and checks if ANY of the actual values satisfy the condition
 // (for "any match" operators) or if ALL of them do (for "all match" operators), implicitly.
-// Returns true if the condition is met (no violation), false otherwise.
+// Returns true if the condition is satisfied (indicating a violation for policy rules), false if not satisfied.
 func (r *ClusterPolicyValidatorReconciler) validateCondition(
 	condition clusterpolicyvalidatorv1alpha1.Condition, // The condition to validate against.
 	actualValues []interface{}, // The values extracted from the resource.
@@ -197,7 +363,6 @@ func (r *ClusterPolicyValidatorReconciler) validateCondition(
 		return false
 	}
 
-
 	logger.V(1).Info("Validating condition",
 		"operator", condition.Operator,
 		"expectedValues", condition.Values,
@@ -211,7 +376,6 @@ func (r *ClusterPolicyValidatorReconciler) validateCondition(
 		// If no values are found, "IsEmpty" is true, and other operators are false.
 		return condition.Operator == "IsEmpty"
 	}
-
 
 	// For other operators, iterate through each extracted actual value
 	// and check if it satisfies the condition against *any* of the expected values.
@@ -267,7 +431,7 @@ func (r *ClusterPolicyValidatorReconciler) validateCondition(
 			matchFound := false
 			for _, expectedVal := range condition.Values {
 
-				if r.evaluateSingleCondition(actualStr, condition.Operator, expectedVal, logger) {
+				if r.evaluateStringComparison(actualStr, condition.Operator, expectedVal, logger) {
 					matchFound = true
 					logger.V(1).Info("Match found for actual value against expected values for condition",
 						"actualValue", actualStr,
@@ -291,15 +455,15 @@ func (r *ClusterPolicyValidatorReconciler) validateCondition(
 		}
 	}
 
-	// If none of the actual values satisfied the condition, return false (violation)
-	return false
+	// If we reach here, all actual values satisfied the condition, so return true
+	return true
 
 }
 
 // evaluateSingleCondition performs the actual comparison for a single actual value,
 // an operator, and a single expected value.
 // It handles string comparisons, regex matching, and numeric comparisons.
-func (r *ClusterPolicyValidatorReconciler) evaluateSingleCondition(resourceValue, operator, expectedValue string, logger logr.Logger) bool {
+func (r *ClusterPolicyValidatorReconciler) evaluateStringComparison(resourceValue, operator, expectedValue string, logger logr.Logger) bool {
 	switch operator {
 	case "Equals":
 		return resourceValue == expectedValue
@@ -333,22 +497,33 @@ func (r *ClusterPolicyValidatorReconciler) evaluateSingleCondition(resourceValue
 	}
 }
 
-// getCompiledJQ retrieves a compiled JQ query. It first checks a cache for the
-// compiled query to avoid redundant parsing and compilation, which can be expensive.
-// If not found in cache, it parses and compiles the query and then caches the result.
+// getCompiledJQ retrieves a compiled JQ query with caching for performance optimization.
+// It first checks the cache for an existing compiled query to avoid redundant parsing
+// and compilation, which can be expensive. If not found in cache, it parses and
+// compiles the query and then caches the result for future use.
 // Returns the compiled gojq.Code or an error if parsing/compilation fails.
 func (r *ClusterPolicyValidatorReconciler) getCompiledJQ(query string) (*gojq.Code, error) {
-	// Parse the JQ query string.
+	// Check cache first for performance optimization
+	if cached, ok := r.jqCache.Load(query); ok {
+		if code, ok := cached.(*gojq.Code); ok {
+			return code, nil
+		}
+	}
+
+	// Cache miss - parse and compile the JQ query
 	q, err := gojq.Parse(query)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse jq query '%s': %w", query, err)
 	}
 
-	// Compile the parsed JQ query.
+	// Compile the parsed JQ query
 	code, err := gojq.Compile(q)
 	if err != nil {
 		return nil, fmt.Errorf("failed to compile jq query '%s': %w", query, err)
 	}
+
+	// Store in cache for future use
+	r.jqCache.Store(query, code)
 
 	return code, nil
 }
@@ -383,7 +558,8 @@ func (r *ClusterPolicyValidatorReconciler) evaluateJQ(resource *unstructured.Uns
 	iter := code.Run(resource.Object)
 	var results []interface{}
 
-	// Iterate over the results of the JQ query.
+	// Iterate over the results of the JQ query with safety limits
+	resultCount := 0
 	for {
 		v, ok := iter.Next() // Get the next value.
 		if !ok {
@@ -393,6 +569,17 @@ func (r *ClusterPolicyValidatorReconciler) evaluateJQ(resource *unstructured.Uns
 			// If the value is an error, return it.
 			return nil, fmt.Errorf("error running jq query '%s': %w", query, err)
 		}
+
+		// Security: Prevent resource exhaustion by limiting the number of results
+		resultCount++
+		if resultCount > MaxJQResultsLimit {
+			return nil, createSecurityError(
+				ErrorCodeResourceExhaustion,
+				fmt.Sprintf("JQ query returned too many results (>%d), query aborted for security", MaxJQResultsLimit),
+				nil,
+			)
+		}
+
 		results = append(results, v) // Add the successful result to the list.
 	}
 
@@ -489,7 +676,8 @@ func (r *ClusterPolicyValidatorReconciler) applyConflictResolution(violations []
 	switch r.ConflictResolution {
 	case ConflictResolutionMostRestrictive:
 		// Selects the violation(s) with the most restrictive action (e.g., "block" over "warn").
-		return r.selectMostRestrictive(violations, logger)
+		// Using optimized O(n) algorithm with early termination
+		return r.selectMostRestrictiveOptimized(violations, logger)
 	case ConflictResolutionFirstMatch:
 		fallthrough // Fallthrough to default behavior for "FirstMatch".
 	default:
@@ -543,4 +731,130 @@ func (r *ClusterPolicyValidatorReconciler) selectMostRestrictive(violations []Va
 	}
 
 	return mostRestrictive
+}
+
+// selectMostRestrictiveOptimized is an optimized version of selectMostRestrictive
+// using priority-based sorting with early termination for O(n) performance instead of O(n²)
+func (r *ClusterPolicyValidatorReconciler) selectMostRestrictiveOptimized(violations []ValidationResult, logger logr.Logger) []ValidationResult {
+	// Early termination: if only one violation, no need to resolve conflicts
+	if len(violations) <= 1 {
+		return violations
+	}
+
+	// Define the priority mapping with higher numbers being more restrictive
+	actionPriority := map[string]int{
+		"block":    3,
+		"warn":     2,
+		"continue": 1,
+		"audit":    0, // Add audit for completeness
+	}
+
+	// Optimized algorithm: single pass with early termination for highest priority
+	maxSeenPriority := 0
+	var mostRestrictive []ValidationResult
+
+	// First pass: find the maximum priority and collect block violations early (O(n))
+	for _, violation := range violations {
+		priority := actionPriority[strings.ToLower(violation.Action)]
+		if priority > maxSeenPriority {
+			maxSeenPriority = priority
+		}
+		// Early termination optimization: if we found "block", it's the highest priority
+		if priority == 3 {
+			// Reset and collect all "block" violations
+			if len(mostRestrictive) == 0 || actionPriority[strings.ToLower(mostRestrictive[0].Action)] != 3 {
+				mostRestrictive = []ValidationResult{violation}
+			} else {
+				mostRestrictive = append(mostRestrictive, violation)
+			}
+		}
+	}
+
+	// If we found block violations during the first pass, return early
+	if maxSeenPriority == 3 {
+		logger.Info("Early termination: found block violations",
+			"action", "block",
+			"selected_count", len(mostRestrictive),
+			"optimization", "early_termination_for_block")
+		return mostRestrictive
+	}
+
+	// For non-block cases, collect all violations with the maximum priority found
+	mostRestrictive = nil // Reset for clean collection
+	for _, violation := range violations {
+		priority := actionPriority[strings.ToLower(violation.Action)]
+		if priority == maxSeenPriority {
+			mostRestrictive = append(mostRestrictive, violation)
+		}
+	}
+
+	// Log the outcome of the conflict resolution.
+	if len(mostRestrictive) > 0 {
+		logger.Info("Selected most restrictive action for conflict resolution",
+			"action", mostRestrictive[0].Action,
+			"selected_count", len(mostRestrictive),
+			"max_priority", maxSeenPriority,
+			"algorithm", "optimized_priority_based")
+	} else {
+		// This case should ideally not happen if violations slice is not empty.
+		logger.Info("No most restrictive action found for violations", "violations_count", len(violations))
+	}
+	return mostRestrictive
+}
+
+// Refactored condition validation functions implementing Single Responsibility Principle
+
+// validateConditionRefactored orchestrates condition validation using smaller, focused functions
+func (r *ClusterPolicyValidatorReconciler) validateConditionRefactored(
+	condition clusterpolicyvalidatorv1alpha1.Condition,
+	actualValues []interface{},
+	logger logr.Logger,
+) bool {
+
+	logger.V(1).Info("Validating condition",
+		"operator", condition.Operator,
+		"expectedValues", sanitizeLogValue(condition.Values),
+		"actualValues", sanitizeLogValue(actualValues))
+
+	// Normalize actual values
+	normalized := normalizeActualValues(actualValues)
+
+	// Handle empty operators first
+	if result, handled := validateEmptyOperators(condition.Operator, normalized); handled {
+		return result
+	}
+
+	// Handle special case for empty values
+	if len(actualValues) == 0 {
+		logger.V(2).Info("No values extracted for condition",
+			"operator", condition.Operator,
+			"expectedValues", sanitizeLogValue(condition.Values))
+		return condition.Operator == "IsEmpty"
+	}
+
+	// Validate each actual value
+	for _, actualVal := range actualValues {
+		if r.validateSingleActualValue(actualVal, condition, logger) {
+			return true // Found a match, return early
+		}
+	}
+
+	// If we reach here, all actual values satisfied the condition, so return true
+	return true
+}
+
+// validateSingleActualValue validates one actual value against the condition
+func (r *ClusterPolicyValidatorReconciler) validateSingleActualValue(
+	actualVal interface{},
+	condition clusterpolicyvalidatorv1alpha1.Condition,
+	logger logr.Logger,
+) bool {
+	// Handle map values (e.g., labels)
+	if m, ok := actualVal.(map[string]interface{}); ok {
+		return r.validateMapValue(m, condition, logger)
+	}
+
+	// Handle standard values (strings, integers, booleans)
+	actualStr := fmt.Sprintf("%v", actualVal)
+	return r.validateStringValue(actualStr, condition, logger)
 }

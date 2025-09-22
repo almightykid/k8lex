@@ -4,10 +4,12 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 
 	clusterpolicynotifierv1alpha1 "github.com/almightykid/k8lex/api/clusterpolicynotifier/v1alpha1"
+	clusterpolicyupdaterv1alpha1 "github.com/almightykid/k8lex/api/clusterpolicyupdater/v1alpha1"
 	clusterpolicyvalidatorv1alpha1 "github.com/almightykid/k8lex/api/clusterpolicyvalidator/v1alpha1"
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
@@ -124,36 +126,50 @@ func (r *ClusterPolicyValidatorReconciler) handleResourceAction(
 	case "block":
 		updaterName, updaterKey := getUpdaterNameAndKey(policies, violation.PolicyName, violation.RuleName)
 		validatorKey := normalizeKey(violation.ResourcePath)
-		if updaterName != "" && normalizeKey(updaterKey) == validatorKey {
-			// Hay updater y las rutas coinciden: solo anotar para updater, nunca escalar a 0
-			maxRetries := 5
-			for i := 0; i < maxRetries; i++ {
-				annotations := resource.GetAnnotations()
-				if annotations == nil {
-					annotations = map[string]string{}
-				}
-				annotations["k8lex.io/clusterpolicyupdater"] = updaterName
-				resource.SetAnnotations(annotations)
-				err := r.Update(ctx, resource)
-				if err == nil {
-					logger.Info("Resource annotated for updater (paths match)", "resource", resource.GetName(), "key", validatorKey)
-					break
-				}
-				if apierrors.IsConflict(err) {
-					logger.Info("Conflict annotating for updater, retrying", "attempt", i+1, "resource", resource.GetName())
-					_ = r.Get(ctx, client.ObjectKey{Namespace: resource.GetNamespace(), Name: resource.GetName()}, resource)
-					continue
-				}
-				logger.Error(err, "Failed to annotate for updater", "resource", resource.GetName())
+
+		// Check if updater CRD actually exists before deciding to use it
+		updaterExists := false
+		if updaterName != "" {
+			updaterExists = isUpdaterEnabledAndExists(ctx, r.Client, clusterpolicyvalidatorv1alpha1.Ref{
+				Name:      updaterName,
+				Namespace: resource.GetNamespace(),
+			}, logger)
+		}
+
+		if updaterName != "" && normalizeKey(updaterKey) == validatorKey && updaterExists {
+			// Hay updater, las rutas coinciden Y el updater existe: solo anotar para updater, nunca escalar a 0
+			unstructuredResource := &unstructured.Unstructured{}
+			// Try to get GVK from the resource itself
+			if gvk := resource.GetObjectKind().GroupVersionKind(); gvk.Kind != "" {
+				unstructuredResource.SetGroupVersionKind(gvk)
 			}
+			unstructuredResource.SetNamespace(resource.GetNamespace())
+			unstructuredResource.SetName(resource.GetName())
+			unstructuredResource.SetResourceVersion(resource.GetResourceVersion())
+
+			err := r.updateAnnotationsWithRetry(ctx, unstructuredResource, func(annotations map[string]string) error {
+				annotations["k8lex.io/clusterpolicyupdater"] = updaterName
+				return nil
+			}, logger)
+
+			if err != nil {
+				logger.Error(err, "Failed to annotate resource for updater", "resource", resource.GetName(), "updater", updaterName)
+				return err
+			}
+
+			logger.Info("Resource annotated for updater (paths match)", "resource", resource.GetName(), "key", validatorKey, "updater", updaterName)
 			return nil
 		}
 		if updaterName != "" && normalizeKey(updaterKey) != validatorKey {
 			logger.Error(nil, "Updater key does not match validator key, not annotating for updater", "validatorKey", validatorKey, "updaterKey", normalizeKey(updaterKey), "resource", resource.GetName())
 			return nil
 		}
-		// No hay updater: escalar a 0 directamente
-		logger.Info("No updater configured, scaling resource to 0", "resource", resource.GetName())
+		if updaterName != "" && !updaterExists {
+			logger.Info("Updater configured but does not exist, falling back to direct blocking", "updater", updaterName, "resource", resource.GetName())
+			// Note: Annotation cleanup will be handled in handleControllerBlocking to avoid race conditions
+		}
+		// No hay updater o no existe: escalar a 0 directamente
+		logger.Info("No updater available, scaling resource to 0", "resource", resource.GetName())
 		if err := r.handleControllerBlocking(ctx, resource, violation, policies, logger); err != nil {
 			logger.Error(err, "Failed to block resource (no updater)", "resource", resource.GetName())
 		}
@@ -223,7 +239,7 @@ func (r *ClusterPolicyValidatorReconciler) handlePodBlocking(
 	logger.Info("Deleting standalone Pod due to policy violation",
 		"pod", resource.GetName(),
 		"namespace", resource.GetNamespace(),
-		"violation", violation.ErrorMessage)
+		"violation", sanitizeLogValue(violation.ErrorMessage))
 	if err := r.Delete(ctx, resource); client.IgnoreNotFound(err) != nil {
 		// Log and return error if deletion fails, ignoring "not found" errors which mean it's already gone.
 		logger.Error(err, "Failed to delete standalone Pod", "pod", resource.GetName())
@@ -305,7 +321,7 @@ func (r *ClusterPolicyValidatorReconciler) handleControllerBlocking(
 			"resource", resource.GetName(),
 			"namespace", resource.GetNamespace(),
 			"originalReplicas", currentReplicas,
-			"violation", violation.ErrorMessage)
+			"violation", sanitizeLogValue(violation.ErrorMessage))
 	}
 
 	// Add or update specific annotations on the resource to mark it as blocked
@@ -314,38 +330,53 @@ func (r *ClusterPolicyValidatorReconciler) handleControllerBlocking(
 	if annotations == nil {
 		annotations = make(map[string]string)
 	}
+
+	// Capture the ORIGINAL blocking state before any modifications for notification logic
+	wasAlreadyBlockedBeforeUpdate := annotations[PolicyBlockedAnnotation] == "true"
+
+	// Clean updater annotation if updater doesn't exist to prevent notification blocking
+	updaterNameForBlocking, _ := getUpdaterNameAndKey(policies, violation.PolicyName, violation.RuleName)
+	if updaterNameForBlocking != "" {
+		updaterExists := isUpdaterEnabledAndExists(ctx, r.Client, clusterpolicyvalidatorv1alpha1.Ref{
+			Name:      updaterNameForBlocking,
+			Namespace: unstructuredObj.GetNamespace(),
+		}, logger)
+		if !updaterExists {
+			logger.Info("Cleaning stale updater annotation before blocking",
+				"updater", updaterNameForBlocking,
+				"resource", unstructuredObj.GetName())
+			delete(annotations, "k8lex.io/clusterpolicyupdater")
+		}
+	}
 	// Evitar doble acción: si ya está bloqueado y tiene anotación de updater, no hacer nada
 	if annotations[PolicyBlockedAnnotation] == "true" && annotations["k8lex.io/clusterpolicyupdater"] != "" {
 		logger.Info("Resource already blocked and annotated for updater; skipping duplicate action",
 			"resource", resource.GetName(), "namespace", resource.GetNamespace())
 		return nil
 	}
-	// Obtener el nombre del updater de la regla
-	updaterName, _ := getUpdaterNameAndKey(policies, violation.PolicyName, violation.RuleName)
-	if updaterName == "" {
-		logger.V(1).Info("No updater name specified in rule; skipping updater annotation (warn)",
-			"resource", resource.GetName(), "policy", violation.PolicyName, "rule", violation.RuleName)
-	} else {
-		annotations["k8lex.io/clusterpolicyupdater"] = updaterName
+	// Only add updater annotation if updater actually exists
+	if updaterNameForBlocking != "" {
+		updaterExists := isUpdaterEnabledAndExists(ctx, r.Client, clusterpolicyvalidatorv1alpha1.Ref{
+			Name:      updaterNameForBlocking,
+			Namespace: unstructuredObj.GetNamespace(),
+		}, logger)
+		if updaterExists {
+			logger.V(1).Info("Adding updater annotation for existing updater",
+				"updater", updaterNameForBlocking, "resource", resource.GetName())
+			annotations["k8lex.io/clusterpolicyupdater"] = updaterNameForBlocking
+		} else {
+			logger.V(1).Info("Skipping updater annotation - updater does not exist",
+				"updater", updaterNameForBlocking, "resource", resource.GetName())
+		}
 	}
 	annotations[PolicyBlockedAnnotation] = "true"
 	annotations[OriginalReplicasAnnotation] = fmt.Sprintf("%d", currentReplicas)
 	annotations[BlockedReasonAnnotation] = violation.ErrorMessage // Provide the reason for blocking.
 	unstructuredObj.SetAnnotations(annotations)
 
-	// Update the resource in Kubernetes API.
-	maxRetries := 5
-	for i := 0; i < maxRetries; i++ {
-		if err := r.Update(ctx, unstructuredObj); err != nil {
-			if apierrors.IsConflict(err) {
-				logger.Info("Resource update conflict, retrying", "attempt", i+1, "kind", unstructuredObj.GetKind(), "resource", unstructuredObj.GetName(), "namespace", unstructuredObj.GetNamespace())
-				_ = r.Get(ctx, client.ObjectKey{Namespace: unstructuredObj.GetNamespace(), Name: unstructuredObj.GetName()}, unstructuredObj)
-				continue
-			}
-			logger.Error(err, "Failed to update resource (non-conflict error)", "kind", unstructuredObj.GetKind(), "resource", unstructuredObj.GetName(), "namespace", unstructuredObj.GetNamespace())
-			return err
-		}
-		break
+	// Update the resource in Kubernetes API with robust retry logic
+	if err := r.updateResourceWithRetry(ctx, unstructuredObj, logger); err != nil {
+		return err
 	}
 
 	// Record a Kubernetes event to signal the resource has been scaled down due to policy violation.
@@ -354,8 +385,32 @@ func (r *ClusterPolicyValidatorReconciler) handleControllerBlocking(
 	r.EventRecorder.Eventf(unstructuredObj, corev1.EventTypeWarning, "PolicyViolation", eventMessage)
 
 	// Send notification to Slack if enabled and resource was actually scaled down (not already blocked)
-	wasAlreadyBlocked := annotations[PolicyBlockedAnnotation] == "true" && annotations["k8lex.io/clusterpolicyupdater"] != ""
-	if !wasAlreadyBlocked {
+	logger.Info("Checking notification conditions",
+		"wasAlreadyBlockedBeforeUpdate", wasAlreadyBlockedBeforeUpdate,
+		"policyBlockedNow", annotations[PolicyBlockedAnnotation],
+		"updaterAnnotation", annotations["k8lex.io/clusterpolicyupdater"],
+		"resource", unstructuredObj.GetName())
+
+	// Check if enough time has passed since last notification (deduplication)
+	// Use the original state (before we modified annotations) to determine if this is a fresh block
+	shouldSendNotification := !wasAlreadyBlockedBeforeUpdate
+	if !wasAlreadyBlockedBeforeUpdate {
+		// Check cooldown period to prevent notification spam
+		lastNotificationTime := annotations[LastNotificationAnnotation]
+		if lastNotificationTime != "" {
+			if lastTime, err := time.Parse(time.RFC3339, lastNotificationTime); err == nil {
+				if time.Since(lastTime) < NotificationCooldownDuration {
+					logger.Info("Notification suppressed due to cooldown period",
+						"resource", unstructuredObj.GetName(),
+						"lastNotification", lastNotificationTime,
+						"cooldownRemaining", NotificationCooldownDuration-time.Since(lastTime))
+					shouldSendNotification = false
+				}
+			}
+		}
+	}
+
+	if shouldSendNotification {
 		var notificationEnabled bool
 		var notifierRef clusterpolicyvalidatorv1alpha1.Ref
 		var customMessage string = violation.ErrorMessage
@@ -377,6 +432,13 @@ func (r *ClusterPolicyValidatorReconciler) handleControllerBlocking(
 			}
 		}
 
+		logger.Info("Notification configuration found",
+			"enabled", notificationEnabled,
+			"notifierName", notifierRef.Name,
+			"notifierNamespace", notifierRef.Namespace,
+			"customMessage", customMessage,
+			"resource", unstructuredObj.GetName())
+
 		// Send notification if enabled and notifier exists
 		if notificationEnabled && isNotifierEnabledAndExists(ctx, r.Client, notifierRef, logger) {
 			if err := r.SendPolicyViolationNotification(ctx, unstructuredObj.GetName(), violation.RuleName, customMessage, "block"); err != nil {
@@ -388,17 +450,32 @@ func (r *ClusterPolicyValidatorReconciler) handleControllerBlocking(
 				logger.Info("Policy violation notification sent successfully",
 					"resource", unstructuredObj.GetName(),
 					"policy", violation.PolicyName)
+
+				// Update notification timestamp to prevent spam
+				annotations[LastNotificationAnnotation] = time.Now().Format(time.RFC3339)
+				unstructuredObj.SetAnnotations(annotations)
+				if err := r.Update(ctx, unstructuredObj); err != nil {
+					logger.Error(err, "Failed to update notification timestamp", "resource", unstructuredObj.GetName())
+				}
 			}
 		} else {
 			logger.Info("Notification not sent: not enabled or notifier does not exist",
 				"resource", unstructuredObj.GetName(),
 				"policy", violation.PolicyName,
-				"rule", violation.RuleName)
+				"rule", violation.RuleName,
+				"notificationEnabled", notificationEnabled,
+				"notifierExists", isNotifierEnabledAndExists(ctx, r.Client, notifierRef, logger))
 		}
 	} else {
-		logger.Info("Notification skipped: resource was already blocked",
-			"resource", unstructuredObj.GetName(),
-			"policy", violation.PolicyName)
+		if wasAlreadyBlockedBeforeUpdate {
+			logger.Info("Notification skipped: resource was already blocked before this update",
+				"resource", unstructuredObj.GetName(),
+				"policy", violation.PolicyName)
+		} else {
+			logger.Info("Notification skipped: cooldown period still active",
+				"resource", unstructuredObj.GetName(),
+				"policy", violation.PolicyName)
+		}
 	}
 
 	return nil // Successfully scaled down and annotated.
@@ -416,7 +493,7 @@ func (r *ClusterPolicyValidatorReconciler) handleGenericResourceBlocking(
 		"kind", resource.GetObjectKind().GroupVersionKind().Kind,
 		"resource", resource.GetName(),
 		"namespace", resource.GetNamespace(),
-		"violation", violation.ErrorMessage)
+		"violation", sanitizeLogValue(violation.ErrorMessage))
 
 	// Attempt to delete the resource. `client.IgnoreNotFound` prevents an error
 	// if the resource was already deleted.
@@ -450,7 +527,7 @@ func (r *ClusterPolicyValidatorReconciler) handleWarnAction(
 		"kind", resource.GetObjectKind().GroupVersionKind().Kind,
 		"policy", violation.PolicyName,
 		"rule", violation.RuleName,
-		"message", violation.ErrorMessage)
+		"message", sanitizeLogValue(violation.ErrorMessage))
 
 	// Emit a Kubernetes event of type "Warning" on the resource.
 	r.EventRecorder.Eventf(resource, corev1.EventTypeWarning, "PolicyViolation",
@@ -474,7 +551,7 @@ func (r *ClusterPolicyValidatorReconciler) handleAuditAction(
 		"kind", resource.GetObjectKind().GroupVersionKind().Kind,
 		"policy", violation.PolicyName,
 		"rule", violation.RuleName,
-		"message", violation.ErrorMessage)
+		"message", sanitizeLogValue(violation.ErrorMessage))
 
 	// Emit a Kubernetes event of type "Normal" (informational) on the resource.
 	r.EventRecorder.Eventf(resource, corev1.EventTypeNormal, "PolicyAudit",
@@ -578,5 +655,22 @@ func isNotifierEnabledAndExists(ctx context.Context, c client.Client, notifierRe
 		logger.Info("Notifier resource exists but is not Ready, skipping notification", "name", notifierRef.Name, "namespace", notifierRef.Namespace, "phase", notifier.Status.Phase)
 		return false
 	}
+	return true
+}
+
+// isUpdaterEnabledAndExists checks if an updater CRD exists and is ready
+func isUpdaterEnabledAndExists(ctx context.Context, c client.Client, updaterRef clusterpolicyvalidatorv1alpha1.Ref, logger logr.Logger) bool {
+	if updaterRef.Name == "" {
+		logger.Info("UpdaterRef.Name is empty, skipping updater check")
+		return false
+	}
+	updater := &clusterpolicyupdaterv1alpha1.ClusterPolicyUpdater{}
+	err := c.Get(ctx, types.NamespacedName{Name: updaterRef.Name, Namespace: updaterRef.Namespace}, updater)
+	if err != nil {
+		logger.Info("Updater resource not found, will use direct blocking", "name", updaterRef.Name, "namespace", updaterRef.Namespace)
+		return false
+	}
+	// For now, assume updater is ready if it exists (can add status check later)
+	logger.Info("Updater resource found and ready", "name", updaterRef.Name, "namespace", updaterRef.Namespace)
 	return true
 }

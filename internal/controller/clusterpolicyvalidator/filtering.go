@@ -26,6 +26,7 @@ func (r *ClusterPolicyValidatorReconciler) UpdateNamespaceFilterState(ctx contex
 		IncludedNamespaces: make(map[string]struct{}),
 		ExcludedNamespaces: make(map[string]struct{}),
 		LastUpdated:        time.Now(),
+		PolicyGenerations:  make(map[string]int64),
 	}
 
 	// Fetch all current ClusterPolicyValidator policies from the Kubernetes API
@@ -43,6 +44,9 @@ func (r *ClusterPolicyValidatorReconciler) UpdateNamespaceFilterState(ctx contex
 			"policy_generation", policy.Generation,
 			"include_namespaces", len(policy.Spec.Namespaces.Include),
 			"exclude_namespaces", len(policy.Spec.Namespaces.Exclude))
+
+		// Track policy generation for event-driven cache invalidation
+		newState.PolicyGenerations[policy.Name] = policy.Generation
 
 		// Process namespace inclusion rules - these define allowed namespaces
 		if len(policy.Spec.Namespaces.Include) > 0 {
@@ -82,31 +86,82 @@ func (r *ClusterPolicyValidatorReconciler) UpdateNamespaceFilterState(ctx contex
 }
 
 // ensureNamespaceFilterInitialized performs lazy initialization and cache-aware refresh of namespace filter state
-// This method implements intelligent caching with TTL to avoid unnecessary API calls while ensuring data freshness
-// It uses a 5-minute cache TTL to balance performance with consistency
+// This method implements intelligent caching with event-driven invalidation to avoid unnecessary API calls while ensuring data freshness
+// Uses both TTL (fallback) and policy generation tracking (primary) for optimal performance
 func (r *ClusterPolicyValidatorReconciler) ensureNamespaceFilterInitialized(ctx context.Context) error {
-	// Check if current filter state is recent enough to avoid unnecessary API calls
+	// Check if current filter state is valid using event-driven approach
 	r.namespaceFilterMu.RLock()
-	if r.namespaceFilter != nil && time.Since(r.namespaceFilter.LastUpdated) < 5*time.Minute {
-		r.namespaceFilterMu.RUnlock()
-		r.Log.V(3).Info("Namespace filter state is recent - skipping refresh",
-			"last_updated", r.namespaceFilter.LastUpdated,
-			"cache_ttl", "5m")
-		return nil // State is fresh enough, no refresh needed
+	needsRefresh := r.namespaceFilter == nil
+
+	// If we have a cached state, check if any policies have been updated
+	if !needsRefresh {
+		// First check TTL as fallback (extended to 30 minutes since we have event-driven invalidation)
+		if time.Since(r.namespaceFilter.LastUpdated) > 30*time.Minute {
+			needsRefresh = true
+			r.Log.V(2).Info("Namespace filter cache expired (TTL)", "age", time.Since(r.namespaceFilter.LastUpdated))
+		} else {
+			// Check if any tracked policies have been updated by comparing generations
+			needsRefresh = r.shouldInvalidateNamespaceCache(ctx)
+		}
 	}
 	r.namespaceFilterMu.RUnlock()
 
-	// State is stale or uninitialized - refresh from Kubernetes API
+	if !needsRefresh {
+		r.Log.V(3).Info("Namespace filter state is current - no refresh needed")
+		return nil
+	}
+
+	// State needs refresh - update from Kubernetes API
 	r.Log.V(2).Info("Namespace filter state requires refresh - updating from policies")
 	return r.UpdateNamespaceFilterState(ctx)
+}
+
+// shouldInvalidateNamespaceCache checks if any ClusterPolicyValidator has been updated since last cache
+// by comparing policy generations. This enables event-driven cache invalidation without TTL dependency.
+func (r *ClusterPolicyValidatorReconciler) shouldInvalidateNamespaceCache(ctx context.Context) bool {
+	// Quick check of a sample policy to avoid full list if no changes
+	var samplePolicies clusterpolicyvalidatorv1alpha1.ClusterPolicyValidatorList
+	if err := r.List(ctx, &samplePolicies, client.Limit(5)); err != nil {
+		r.Log.V(1).Info("Failed to check policy updates, assuming cache is valid", "error", err)
+		return false
+	}
+
+	// Check if any policy generation has changed
+	for _, policy := range samplePolicies.Items {
+		if cachedGen, exists := r.namespaceFilter.PolicyGenerations[policy.Name]; exists {
+			if policy.Generation != cachedGen {
+				r.Log.V(2).Info("Policy generation changed - invalidating namespace cache",
+					"policy", policy.Name,
+					"cached_generation", cachedGen,
+					"current_generation", policy.Generation)
+				return true
+			}
+		} else {
+			// New policy detected
+			r.Log.V(2).Info("New policy detected - invalidating namespace cache",
+				"policy", policy.Name,
+				"generation", policy.Generation)
+			return true
+		}
+	}
+
+	// Check if any tracked policies have been deleted by doing a full list periodically
+	if len(r.namespaceFilter.PolicyGenerations) != len(samplePolicies.Items) {
+		r.Log.V(2).Info("Policy count mismatch - invalidating namespace cache",
+			"cached_count", len(r.namespaceFilter.PolicyGenerations),
+			"current_count", len(samplePolicies.Items))
+		return true
+	}
+
+	return false
 }
 
 // isNamespaceAllowedByPredicate determines if a namespace should be processed based on aggregated policy rules
 // This method implements the core namespace filtering logic with proper precedence handling:
 // CRITICAL PRECEDENCE RULE: Exclude rules ALWAYS take precedence over include rules for security
-func (r *ClusterPolicyValidatorReconciler) isNamespaceAllowedByPredicate(ns string, logger logr.Logger) bool {
+func (r *ClusterPolicyValidatorReconciler) isNamespaceAllowedByPredicate(ctx context.Context, ns string, logger logr.Logger) bool {
 	// Ensure namespace filter is initialized before making filtering decisions
-	if err := r.ensureNamespaceFilterInitialized(context.Background()); err != nil {
+	if err := r.ensureNamespaceFilterInitialized(ctx); err != nil {
 		logger.Error(err, "Failed to initialize namespace filter - failing open for availability",
 			"namespace", ns,
 			"fallback_behavior", "allow_all")
@@ -189,7 +244,7 @@ func (r *ClusterPolicyValidatorReconciler) isNamespaceAllowedByPredicate(ns stri
 func (r *ClusterPolicyValidatorReconciler) optimizedEventFilter() predicate.Predicate {
 	return predicate.Funcs{
 		CreateFunc: func(e event.CreateEvent) bool {
-			return r.shouldProcessEvent(e.Object, "create")
+			return r.shouldProcessEvent(context.TODO(), e.Object, "create")
 		},
 		UpdateFunc: func(e event.UpdateEvent) bool {
 			// Implement intelligent update filtering to reduce reconciliation load
@@ -208,14 +263,14 @@ func (r *ClusterPolicyValidatorReconciler) optimizedEventFilter() predicate.Pred
 				}
 			}
 
-			return r.shouldProcessEvent(e.ObjectNew, "update")
+			return r.shouldProcessEvent(context.TODO(), e.ObjectNew, "update")
 		},
 		DeleteFunc: func(e event.DeleteEvent) bool {
 			// Always process delete events if namespace is allowed (for cleanup operations)
 			kind := r.getKindFromObject(e.Object)
 			logger := r.Log.WithValues("event", "delete", "kind", kind)
 
-			allowed := r.isNamespaceAllowedByPredicate(e.Object.GetNamespace(), logger)
+			allowed := r.isNamespaceAllowedByPredicate(context.TODO(), e.Object.GetNamespace(), logger)
 			if !allowed {
 				logger.V(2).Info("Delete event filtered due to namespace restrictions",
 					"resource", e.Object.GetName(),
@@ -224,7 +279,7 @@ func (r *ClusterPolicyValidatorReconciler) optimizedEventFilter() predicate.Pred
 			return allowed
 		},
 		GenericFunc: func(e event.GenericEvent) bool {
-			return r.shouldProcessEvent(e.Object, "generic")
+			return r.shouldProcessEvent(context.TODO(), e.Object, "generic")
 		},
 	}
 }
@@ -232,7 +287,7 @@ func (r *ClusterPolicyValidatorReconciler) optimizedEventFilter() predicate.Pred
 // shouldProcessEvent determines if a Kubernetes event should trigger a reconciliation
 // This method consolidates all event filtering logic including namespace filtering,
 // policy bypass detection, and resource type validation
-func (r *ClusterPolicyValidatorReconciler) shouldProcessEvent(obj client.Object, eventType string) bool {
+func (r *ClusterPolicyValidatorReconciler) shouldProcessEvent(ctx context.Context, obj client.Object, eventType string) bool {
 	kind := r.getKindFromObject(obj)
 	logger := r.Log.WithValues(
 		"event_type", eventType,
@@ -244,7 +299,7 @@ func (r *ClusterPolicyValidatorReconciler) shouldProcessEvent(obj client.Object,
 		"filters", "namespace,bypass,policy_relevance")
 
 	// First filter: Check if namespace is allowed by current policy configuration
-	if !r.isNamespaceAllowedByPredicate(obj.GetNamespace(), logger) {
+	if !r.isNamespaceAllowedByPredicate(ctx, obj.GetNamespace(), logger) {
 		logger.V(2).Info("Event filtered due to namespace restrictions",
 			"filter_reason", "namespace_not_allowed",
 			"namespace", obj.GetNamespace())

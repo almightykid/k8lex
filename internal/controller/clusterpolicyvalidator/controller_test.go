@@ -404,21 +404,21 @@ var _ = Describe("ClusterPolicyValidator Controller", func() {
 		It("should process resources in included namespaces", func() {
 			By("Verifying namespace is allowed")
 			logger := reconciler.Log.WithName("test")
-			allowed := reconciler.isNamespaceAllowedByPredicate(testNamespace, logger)
+			allowed := reconciler.isNamespaceAllowedByPredicate(ctx, testNamespace, logger)
 			Expect(allowed).To(BeTrue())
 		})
 
 		It("should not process resources in excluded namespaces", func() {
 			By("Verifying excluded namespace is blocked")
 			logger := reconciler.Log.WithName("test")
-			allowed := reconciler.isNamespaceAllowedByPredicate("kube-system", logger)
+			allowed := reconciler.isNamespaceAllowedByPredicate(ctx, "kube-system", logger)
 			Expect(allowed).To(BeFalse())
 		})
 
 		It("should not process resources not in included namespaces", func() {
 			By("Verifying non-included namespace is blocked")
 			logger := reconciler.Log.WithName("test")
-			allowed := reconciler.isNamespaceAllowedByPredicate("other-namespace", logger)
+			allowed := reconciler.isNamespaceAllowedByPredicate(ctx, "other-namespace", logger)
 			Expect(allowed).To(BeFalse())
 		})
 	})

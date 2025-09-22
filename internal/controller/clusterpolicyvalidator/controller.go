@@ -177,7 +177,7 @@ func (r *ClusterPolicyValidatorReconciler) Reconcile(ctx context.Context, req ct
 
 // validateResource performs resource validation
 func (r *ClusterPolicyValidatorReconciler) validateResource(ctx context.Context, req ctrl.Request, logger logr.Logger) (ctrl.Result, error) {
-	foundResource, resourceGVK, err := r.findResource(ctx, req, logger)
+	foundResource, resourceGVK, err := r.findResourceOptimized(ctx, req, logger)
 	if err != nil {
 		logger.Error(err, "Resource discovery failed")
 		return ctrl.Result{}, err
@@ -189,7 +189,7 @@ func (r *ClusterPolicyValidatorReconciler) validateResource(ctx context.Context,
 		return ctrl.Result{}, nil
 	}
 
-	if !r.isNamespaceAllowedByPredicate(foundResource.GetNamespace(), logger) {
+	if !r.isNamespaceAllowedByPredicate(ctx, foundResource.GetNamespace(), logger) {
 		logger.Info("Skipping resource due to namespace filtering", "namespace", foundResource.GetNamespace())
 		return ctrl.Result{}, nil
 	}
